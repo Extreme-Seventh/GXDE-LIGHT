@@ -1,7 +1,8 @@
+✨ Features
 🌅 Sunrise-style ramp-up
 🌙 Ramp-down
 ⏱️ User-defined start time
-⏳ User-defined ON duration (8h, 12h, etc.)
+⏳ User-defined ON duration — 8h, 12h, etc.
 💡 Maximum brightness control
 📈 Adjustable ramp-up/down duration
 🕐 NTP real-time clock
