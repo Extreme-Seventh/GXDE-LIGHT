@@ -1,0 +1,948 @@
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>GXDE LIGHT</title>
+
+<style>
+
+*{
+box-sizing:border-box;
+}
+
+body{
+
+margin:0;
+min-height:100vh;
+
+background:
+radial-gradient(
+circle at top,
+#0f2027,
+#000
+);
+
+font-family:
+Arial,
+Helvetica,
+sans-serif;
+
+color:#00ffe1;
+
+display:flex;
+justify-content:center;
+align-items:center;
+
+padding:15px;
+}
+
+.panel{
+
+width:min(
+700px,
+100%
+);
+
+background:
+rgba(0,255,225,.05);
+
+border:
+1px solid
+rgba(0,255,225,.3);
+
+border-radius:22px;
+
+padding:22px;
+
+box-shadow:
+0 0 40px
+rgba(0,255,225,.15);
+}
+
+h1{
+
+text-align:center;
+
+margin:
+0 0 6px;
+
+letter-spacing:4px;
+
+font-size:
+clamp(
+24px,
+6vw,
+34px
+);
+}
+
+.subtitle{
+
+text-align:center;
+
+opacity:.5;
+
+font-size:11px;
+
+letter-spacing:2px;
+
+margin-bottom:25px;
+}
+
+.clock{
+
+text-align:center;
+
+font-size:
+clamp(
+34px,
+10vw,
+55px
+);
+
+font-weight:bold;
+
+color:#00ff9c;
+
+text-shadow:
+0 0 15px
+rgba(0,255,156,.5);
+
+margin-bottom:20px;
+}
+
+.status{
+
+display:flex;
+
+justify-content:center;
+
+align-items:center;
+
+gap:8px;
+
+margin-bottom:20px;
+}
+
+.dot{
+
+width:10px;
+height:10px;
+
+border-radius:50%;
+
+background:#00ff9c;
+
+box-shadow:
+0 0 12px #00ff9c;
+}
+
+.card{
+
+background:
+rgba(0,255,225,.04);
+
+border:
+1px solid
+rgba(0,255,225,.18);
+
+border-radius:15px;
+
+padding:15px;
+
+margin-bottom:13px;
+}
+
+.title{
+
+display:flex;
+
+justify-content:
+space-between;
+
+margin-bottom:10px;
+
+font-size:13px;
+
+letter-spacing:1px;
+}
+
+.value{
+
+color:#00ff9c;
+
+font-weight:bold;
+}
+
+input{
+
+width:100%;
+}
+
+input[type=time]{
+
+background:#001514;
+
+color:#00ffe1;
+
+border:
+1px solid
+rgba(0,255,225,.3);
+
+border-radius:8px;
+
+padding:10px;
+
+font-size:18px;
+}
+
+input[type=range]{
+
+accent-color:#00ffe1;
+}
+
+.buttons{
+
+display:grid;
+
+grid-template-columns:
+1fr 1fr;
+
+gap:10px;
+}
+
+button{
+
+border:0;
+
+border-radius:12px;
+
+padding:15px;
+
+font-weight:bold;
+
+cursor:pointer;
+
+color:#001b18;
+
+background:
+linear-gradient(
+145deg,
+#00fff0,
+#00a99b
+);
+}
+
+button.off{
+
+background:
+linear-gradient(
+145deg,
+#ff5555,
+#aa0000
+);
+
+color:white;
+}
+
+button.save{
+
+grid-column:
+1 / -1;
+
+background:
+linear-gradient(
+145deg,
+#00ff9c,
+#00b968
+);
+}
+
+.schedule{
+
+text-align:center;
+
+line-height:1.8;
+
+font-size:13px;
+
+opacity:.8;
+}
+
+.schedule span{
+
+color:#00ff9c;
+
+font-weight:bold;
+}
+
+.saveStatus{
+
+text-align:center;
+
+font-size:11px;
+
+letter-spacing:1px;
+
+margin-top:10px;
+
+height:15px;
+
+color:#00ff9c;
+
+opacity:0;
+
+transition:
+opacity .3s;
+}
+
+.saveStatus.show{
+
+opacity:1;
+}
+
+.footer{
+
+text-align:center;
+
+font-size:10px;
+
+opacity:.4;
+
+margin-top:15px;
+
+letter-spacing:1px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="panel">
+
+<h1>GXDE</h1>
+
+<div class="subtitle">
+SMART LIGHT CONTROLLER
+</div>
+
+<div class="clock"
+id="clock">
+--:--:--
+</div>
+
+<div class="status">
+
+<div class="dot"></div>
+
+<span id="status">
+LIGHT OFF
+</span>
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+
+<span>START TIME</span>
+
+</div>
+
+<input
+type="time"
+id="start">
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+
+<span>LIGHT DURATION</span>
+
+<span
+class="value"
+id="durationValue">
+12h 00m
+</span>
+
+</div>
+
+<input
+type="range"
+id="duration"
+min="1"
+max="1440"
+value="720">
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+
+<span>MAX BRIGHTNESS</span>
+
+<span
+class="value"
+id="brightnessValue">
+100%
+</span>
+
+</div>
+
+<input
+type="range"
+id="brightness"
+min="1"
+max="100"
+value="100">
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+
+<span>RAMP UP</span>
+
+<span
+class="value"
+id="rampUpValue">
+10 min
+</span>
+
+</div>
+
+<input
+type="range"
+id="rampUp"
+min="0"
+max="120"
+value="10">
+
+</div>
+
+
+<div class="card">
+
+<div class="title">
+
+<span>RAMP DOWN</span>
+
+<span
+class="value"
+id="rampDownValue">
+10 min
+</span>
+
+</div>
+
+<input
+type="range"
+id="rampDown"
+min="0"
+max="120"
+value="10">
+
+</div>
+
+
+<div class="card schedule">
+
+<div>
+START:
+<span id="scheduleStart">--:--</span>
+</div>
+
+<div>
+FULL BRIGHTNESS:
+<span id="scheduleFull">--:--</span>
+</div>
+
+<div>
+OFF:
+<span id="scheduleOff">--:--</span>
+</div>
+
+</div>
+
+
+<div class="buttons">
+
+<button
+onclick="manualOn()">
+LIGHT ON
+</button>
+
+<button
+class="off"
+onclick="manualOff()">
+LIGHT OFF
+</button>
+
+<button
+class="save"
+onclick="save()">
+SAVE SETTINGS
+</button>
+
+</div>
+
+
+<div
+class="saveStatus"
+id="saveStatus">
+
+SETTINGS SAVED
+
+</div>
+
+
+<div class="footer">
+GXDE LIGHT CONTROLLER
+</div>
+
+</div>
+
+
+<script>
+
+const $ =
+id =>
+document.getElementById(id);
+
+
+// ==========================================================
+// FORMAT TIME
+// ==========================================================
+
+function formatTime(
+  totalMinutes
+){
+
+  totalMinutes =
+    (
+      totalMinutes % 1440 +
+      1440
+    ) % 1440;
+
+
+  let h =
+    Math.floor(
+      totalMinutes / 60
+    );
+
+
+  let m =
+    totalMinutes % 60;
+
+
+  return (
+    String(h).padStart(2,"0") +
+    ":" +
+    String(m).padStart(2,"0")
+  );
+}
+
+
+// ==========================================================
+// UPDATE SLIDER VALUES
+// ==========================================================
+
+function updateValues(){
+
+  let d =
+    parseInt(
+      $("duration").value
+    );
+
+
+  let h =
+    Math.floor(
+      d / 60
+    );
+
+
+  let m =
+    d % 60;
+
+
+  $("durationValue").innerText =
+    h + "h " +
+    String(m).padStart(2,"0") +
+    "m";
+
+
+  $("brightnessValue").innerText =
+    $("brightness").value +
+    "%";
+
+
+  $("rampUpValue").innerText =
+    $("rampUp").value +
+    " min";
+
+
+  $("rampDownValue").innerText =
+    $("rampDown").value +
+    " min";
+
+
+  updateSchedule();
+}
+
+
+// ==========================================================
+// UPDATE SCHEDULE
+// ==========================================================
+
+function updateSchedule(){
+
+  let startValue =
+    $("start").value;
+
+
+  if(!startValue){
+
+    $("scheduleStart").innerText =
+      "--:--";
+
+    $("scheduleFull").innerText =
+      "--:--";
+
+    $("scheduleOff").innerText =
+      "--:--";
+
+    return;
+  }
+
+
+  let parts =
+    startValue.split(":");
+
+
+  let start =
+    parseInt(parts[0]) * 60 +
+    parseInt(parts[1]);
+
+
+  let duration =
+    parseInt(
+      $("duration").value
+    );
+
+
+  let rampUp =
+    parseInt(
+      $("rampUp").value
+    );
+
+
+  $("scheduleStart").innerText =
+    formatTime(start);
+
+
+  $("scheduleFull").innerText =
+    formatTime(
+      start + rampUp
+    );
+
+
+  $("scheduleOff").innerText =
+    formatTime(
+      start + duration
+    );
+}
+
+
+// ==========================================================
+// LOAD ACTUAL SAVED SETTINGS
+// ==========================================================
+
+async function loadSettings(){
+
+  try{
+
+    let response =
+      await fetch(
+        "/settings"
+      );
+
+
+    if(!response.ok)
+      return;
+
+
+    let data =
+      await response.json();
+
+
+    $("start").value =
+      String(
+        data.startHour
+      ).padStart(2,"0")
+      +
+      ":"
+      +
+      String(
+        data.startMinute
+      ).padStart(2,"0");
+
+
+    $("duration").value =
+      data.duration;
+
+
+    $("brightness").value =
+      data.brightness;
+
+
+    $("rampUp").value =
+      data.rampUp;
+
+
+    $("rampDown").value =
+      data.rampDown;
+
+
+    updateValues();
+
+    updateSchedule();
+
+
+  }catch(e){
+
+    console.log(
+      "Failed to load settings",
+      e
+    );
+  }
+}
+
+
+// ==========================================================
+// CLOCK / STATUS
+// ==========================================================
+
+async function update(){
+
+  try{
+
+    let r =
+      await fetch(
+        "/status"
+      );
+
+
+    let d =
+      await r.json();
+
+
+    $("clock").innerText =
+      d.time;
+
+
+    $("status").innerText =
+      "LIGHT " +
+      (
+        d.brightness > 0
+          ? "ON"
+          : "OFF"
+      );
+
+
+  }catch(e){
+
+    $("clock").innerText =
+      "--:--:--";
+  }
+}
+
+
+// ==========================================================
+// SAVE SETTINGS
+// ==========================================================
+
+async function save(){
+
+  let params =
+    new URLSearchParams({
+
+      start:
+        $("start").value,
+
+      duration:
+        $("duration").value,
+
+      brightness:
+        $("brightness").value,
+
+      rampUp:
+        $("rampUp").value,
+
+      rampDown:
+        $("rampDown").value
+    });
+
+
+  try{
+
+    let response =
+      await fetch(
+        "/save?" +
+        params.toString()
+      );
+
+
+    if(!response.ok){
+
+      alert(
+        "Failed to save settings"
+      );
+
+      return;
+    }
+
+
+    let data =
+      await response.json();
+
+
+    if(data.success){
+
+      await loadSettings();
+
+
+      let status =
+        $("saveStatus");
+
+
+      status.innerText =
+        "SETTINGS SAVED";
+
+
+      status.classList.add(
+        "show"
+      );
+
+
+      setTimeout(
+        () => {
+
+          status.classList.remove(
+            "show"
+          );
+
+        },
+        2500
+      );
+
+
+    }else{
+
+      alert(
+        "Failed to save settings"
+      );
+    }
+
+
+  }catch(e){
+
+    alert(
+      "Connection error while saving"
+    );
+  }
+}
+
+
+// ==========================================================
+// MANUAL CONTROL
+// ==========================================================
+
+function manualOn(){
+
+  fetch(
+    "/manual?state=1"
+  );
+}
+
+
+function manualOff(){
+
+  fetch(
+    "/manual?state=0"
+  );
+}
+
+
+// ==========================================================
+// SLIDERS
+// ==========================================================
+
+[
+  "duration",
+  "brightness",
+  "rampUp",
+  "rampDown"
+].forEach(
+
+  id =>
+
+  $(id).addEventListener(
+    "input",
+    updateValues
+  )
+);
+
+
+// ==========================================================
+// START TIME
+// ==========================================================
+
+$("start").addEventListener(
+  "change",
+  updateSchedule
+);
+
+
+// ==========================================================
+// INIT
+// ==========================================================
+
+async function init(){
+
+  await loadSettings();
+
+  update();
+}
+
+
+init();
+
+
+setInterval(
+  update,
+  1000
+);
+
+</script>
+
+</body>
+
+</html>
