@@ -4,51 +4,85 @@
    ESP8266 / NodeMCU V3
    ============================================================
 
-   FEATURES
+   TIME SYSTEM
    ------------------------------------------------------------
-   - NTP real-time clock
-   - Philippines UTC+8
-   - User-defined start time
-   - User-defined ON duration
-   - Smooth ramp up
-   - Smooth ramp down
-   - Maximum brightness
-   - Lighting settings saved to LittleFS
-   - Wi-Fi credentials saved separately to LittleFS
-   - Automatic Wi-Fi reconnection
-   - Automatic AP fallback if Wi-Fi cannot connect
-   - Automatic recovery after power interruption
-   - Responsive web UI
-   - Manual ON/OFF
-   - Schedule preview
-   - Save confirmation
-   - Built-in Wi-Fi provisioning AP
-   - FLASH button Wi-Fi credential reset
+   DS1302 RTC = primary time source after boot
 
-   HARDWARE
+   NTP = accurate time synchronization
+
+   Startup:
+       DS1302
+          |
+          v
+       ESP system clock
+          |
+          v
+       WiFi connection
+          |
+          v
+       NTP synchronization
+          |
+          v
+       Corrected time written back to DS1302
+
+
+   RTC
    ------------------------------------------------------------
-   PWM output:
-       D5 / GPIO14
+   DS1302 keeps time during ESP8266 power outage.
 
-   FLASH button:
-       GPIO0
+   IMPORTANT:
+   The DS1302 must have a working backup battery.
 
-   MOSFET:
-       PWM controlled from D5
+   The RTC stores Philippines local time.
 
-   IMPORTANT
+   Philippines:
+       UTC +8
+       No daylight saving time
+
+
+   WIFI
    ------------------------------------------------------------
-   GPIO0 is the ESP8266 boot strap pin.
-
-   Release the FLASH button before the ESP restarts.
-
-   Wi-Fi credentials:
+   Saved credentials:
        /wifi.txt
 
    Lighting settings:
        /settings.txt
 
-   Wi-Fi reset NEVER deletes lighting settings.
+   Startup:
+       Saved WiFi
+           |
+           +-- connected --> normal operation
+           |
+           +-- failed ----> GXDE-LIGHT AP
+
+
+   PWM
+   ------------------------------------------------------------
+   PWM output:
+       D5 / GPIO14
+
+   PWM range:
+       0 - 1023
+
+   Brightness:
+       0 - 100%
+
+   Ramp-up and ramp-down are calculated using SECONDS,
+   not minutes, so the transition is smooth.
+
+
+   FLASH BUTTON
+   ------------------------------------------------------------
+   GPIO0
+
+   Hold FLASH for 5 seconds:
+       Delete /wifi.txt
+       Keep lighting settings
+       Restart ESP8266
+       Start AP mode
+
+
+   ============================================================
 */
 
 
@@ -56,16 +90,54 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
+
 #include <time.h>
+#include <sys/time.h>
+
+#include <RtcDS1302.h>
 
 
 // ============================================================
 // HARDWARE
 // ============================================================
 
+// ------------------------------------------------------------
+// MOSFET PWM
+// ------------------------------------------------------------
+
 #define PWM_PIN D5
 
+// NodeMCU FLASH button
 #define WIFI_BUTTON_PIN 0
+
+
+// ------------------------------------------------------------
+// DS1302 RTC
+//
+// Makuna RtcDS1302:
+//   RST / CE = D6
+//   DAT / IO = D2
+//   CLK      = D1
+// ------------------------------------------------------------
+
+#define RTC_CLK_PIN D1
+#define RTC_DAT_PIN D2
+#define RTC_RST_PIN D6
+
+
+// Create RTC object
+ThreeWire rtcWire(
+  RTC_DAT_PIN,
+  RTC_CLK_PIN,
+  RTC_RST_PIN);
+
+RtcDS1302<ThreeWire> rtc(
+  rtcWire);
+
+
+// ============================================================
+// PWM
+// ============================================================
 
 #define PWM_MAX 1023
 
@@ -81,26 +153,14 @@ const char* AP_PASSWORD =
   "12345678";
 
 
-// ============================================================
-// WIFI TIMING
-// ============================================================
-
-const unsigned long WIFI_CONNECT_TIMEOUT_MS =
+// How long to try saved WiFi during boot
+const unsigned long WIFI_CONNECT_TIMEOUT =
   8000;
 
-const unsigned long WIFI_RECONNECT_INTERVAL_MS =
-  10000;
 
-const unsigned long WIFI_AP_RETRY_INTERVAL_MS =
+// Periodic WiFi retry
+const unsigned long WIFI_RETRY_INTERVAL =
   30000;
-
-
-// ============================================================
-// LIGHT UPDATE
-// ============================================================
-
-const unsigned long LIGHT_UPDATE_INTERVAL_MS =
-  100;
 
 
 // ============================================================
@@ -127,6 +187,7 @@ struct Settings {
   int maxBrightness;
 };
 
+
 Settings settings;
 
 
@@ -139,9 +200,6 @@ String wifiPassword = "";
 
 bool apMode = false;
 
-unsigned long lastWiFiReconnectAttempt = 0;
-unsigned long lastAPRetryAttempt = 0;
-
 
 // ============================================================
 // RUNTIME
@@ -153,6 +211,26 @@ bool manualState = false;
 int currentBrightness = 0;
 
 unsigned long lastLightUpdate = 0;
+
+unsigned long lastWiFiRetry = 0;
+
+
+// ============================================================
+// NTP
+// ============================================================
+
+bool ntpStarted = false;
+bool ntpSynchronized = false;
+
+unsigned long ntpStartMillis = 0;
+
+const unsigned long NTP_CHECK_INTERVAL =
+  1000;
+
+const unsigned long NTP_SYNC_TIMEOUT =
+  30000;
+
+unsigned long lastNtpCheck = 0;
 
 
 // ============================================================
@@ -174,22 +252,26 @@ const unsigned long WIFI_BUTTON_HOLD_MS =
 
 
 // ============================================================
-// DEFAULT SETTINGS
+// DEFAULT LIGHT SETTINGS
 // ============================================================
 
 void defaultSettings() {
 
   settings.startHour = 18;
+
   settings.startMinute = 0;
 
   settings.durationMinutes =
     12 * 60;
 
-  settings.rampUpMinutes = 10;
+  settings.rampUpMinutes =
+    10;
 
-  settings.rampDownMinutes = 10;
+  settings.rampDownMinutes =
+    10;
 
-  settings.maxBrightness = 100;
+  settings.maxBrightness =
+    100;
 }
 
 
@@ -203,6 +285,7 @@ bool saveSettings() {
     LittleFS.open(
       "/settings.txt",
       "w");
+
 
   if (!file) {
 
@@ -231,11 +314,13 @@ bool saveSettings() {
   file.println(
     settings.maxBrightness);
 
+
   file.close();
 
 
   Serial.println(
     "Lighting settings saved");
+
 
   return true;
 }
@@ -257,6 +342,7 @@ bool loadSettings() {
     Serial.println(
       "Using defaults");
 
+
     defaultSettings();
 
     saveSettings();
@@ -269,6 +355,7 @@ bool loadSettings() {
     LittleFS.open(
       "/settings.txt",
       "r");
+
 
   if (!file) {
 
@@ -299,6 +386,7 @@ bool loadSettings() {
   settings.maxBrightness =
     file.readStringUntil('\n').toInt();
 
+
   file.close();
 
 
@@ -312,11 +400,13 @@ bool loadSettings() {
       0,
       23);
 
+
   settings.startMinute =
     constrain(
       settings.startMinute,
       0,
       59);
+
 
   settings.durationMinutes =
     constrain(
@@ -324,17 +414,20 @@ bool loadSettings() {
       1,
       1440);
 
+
   settings.rampUpMinutes =
     constrain(
       settings.rampUpMinutes,
       0,
       120);
 
+
   settings.rampDownMinutes =
     constrain(
       settings.rampDownMinutes,
       0,
       120);
+
 
   settings.maxBrightness =
     constrain(
@@ -343,38 +436,9 @@ bool loadSettings() {
       100);
 
 
-  // ----------------------------------------------------------
-  // Prevent ramps from overlapping
-  // ----------------------------------------------------------
-
-  if (
-    settings.durationMinutes < 1440) {
-
-    if (
-      settings.rampUpMinutes > settings.durationMinutes) {
-
-      settings.rampUpMinutes =
-        settings.durationMinutes;
-    }
-
-
-    int remaining =
-      settings.durationMinutes - settings.rampUpMinutes;
-
-
-    if (
-      settings.rampDownMinutes > remaining) {
-
-      settings.rampDownMinutes =
-        max(
-          0,
-          remaining);
-    }
-  }
-
-
   Serial.println(
     "Lighting settings loaded");
+
 
   return true;
 }
@@ -393,6 +457,7 @@ bool saveWiFiCredentials(
       "/wifi.txt",
       "w");
 
+
   if (!file) {
 
     Serial.println(
@@ -408,6 +473,7 @@ bool saveWiFiCredentials(
   file.println(
     password);
 
+
   file.close();
 
 
@@ -420,6 +486,7 @@ bool saveWiFiCredentials(
 
   Serial.println(
     "WiFi credentials saved");
+
 
   return true;
 }
@@ -450,6 +517,7 @@ bool loadWiFiCredentials() {
       "/wifi.txt",
       "r");
 
+
   if (!file) {
 
     Serial.println(
@@ -467,6 +535,7 @@ bool loadWiFiCredentials() {
 
   wifiPassword =
     file.readStringUntil('\n');
+
 
   file.close();
 
@@ -490,6 +559,7 @@ bool loadWiFiCredentials() {
 
   Serial.println(
     wifiSSID);
+
 
   return true;
 }
@@ -546,7 +616,7 @@ void deleteWiFiCredentials() {
 
 
 // ============================================================
-// PWM
+// PWM / BRIGHTNESS
 // ============================================================
 
 void setBrightness(
@@ -572,6 +642,13 @@ void setBrightness(
       PWM_MAX);
 
 
+  pwm =
+    constrain(
+      pwm,
+      0,
+      PWM_MAX);
+
+
   analogWrite(
     PWM_PIN,
     pwm);
@@ -579,7 +656,213 @@ void setBrightness(
 
 
 // ============================================================
-// TIME VALIDATION
+// RTC VALIDATION
+// ============================================================
+
+bool isRTCValid() {
+
+  return rtc.IsDateTimeValid();
+}
+
+
+// ============================================================
+// SET ESP SYSTEM CLOCK FROM RTC
+// ============================================================
+
+bool setSystemTimeFromRTC() {
+
+  Serial.println();
+  Serial.println(
+    "Reading time from DS1302...");
+
+
+  if (
+    !rtc.IsDateTimeValid()) {
+
+    Serial.println(
+      "DS1302 time is INVALID.");
+
+    return false;
+  }
+
+
+  RtcDateTime dt =
+    rtc.GetDateTime();
+
+
+  Serial.print(
+    "DS1302 time: ");
+
+  Serial.print(
+    dt.Year());
+
+  Serial.print("-");
+
+  Serial.print(
+    dt.Month());
+
+  Serial.print("-");
+
+  Serial.print(
+    dt.Day());
+
+  Serial.print(" ");
+
+  Serial.print(
+    dt.Hour());
+
+  Serial.print(":");
+
+  Serial.print(
+    dt.Minute());
+
+  Serial.print(":");
+
+  Serial.println(
+    dt.Second());
+
+
+  // ----------------------------------------------------------
+  // Set timezone.
+  //
+  // PHT = Philippines Time
+  // UTC +8
+  // No DST
+  // ----------------------------------------------------------
+
+  setenv(
+    "TZ",
+    "PHT-8",
+    1);
+
+  tzset();
+
+
+  struct tm tmRTC;
+
+  memset(
+    &tmRTC,
+    0,
+    sizeof(tmRTC));
+
+
+  tmRTC.tm_year =
+    dt.Year() - 1900;
+
+  tmRTC.tm_mon =
+    dt.Month() - 1;
+
+  tmRTC.tm_mday =
+    dt.Day();
+
+  tmRTC.tm_hour =
+    dt.Hour();
+
+  tmRTC.tm_min =
+    dt.Minute();
+
+  tmRTC.tm_sec =
+    dt.Second();
+
+  tmRTC.tm_isdst =
+    0;
+
+
+  // mktime interprets tmRTC using the configured timezone.
+  time_t epoch =
+    mktime(
+      &tmRTC);
+
+
+  if (
+    epoch <= 0) {
+
+    Serial.println(
+      "ERROR: Failed converting RTC time.");
+
+    return false;
+  }
+
+
+  struct timeval tv;
+
+  tv.tv_sec =
+    epoch;
+
+  tv.tv_usec =
+    0;
+
+
+  settimeofday(
+    &tv,
+    nullptr);
+
+
+  Serial.println(
+    "ESP system clock restored from DS1302.");
+
+
+  return true;
+}
+
+
+// ============================================================
+// WRITE SYSTEM TIME TO RTC
+// ============================================================
+
+bool updateRTCFromSystemTime() {
+
+  time_t now =
+    time(nullptr);
+
+
+  if (
+    now < 1577836800) {
+
+    Serial.println(
+      "ERROR: System time is invalid.");
+
+    return false;
+  }
+
+
+  struct tm* t =
+    localtime(
+      &now);
+
+
+  if (!t) {
+
+    Serial.println(
+      "ERROR: localtime() failed.");
+
+    return false;
+  }
+
+
+  RtcDateTime newTime(
+    t->tm_year + 1900,
+    t->tm_mon + 1,
+    t->tm_mday,
+    t->tm_hour,
+    t->tm_min,
+    t->tm_sec);
+
+
+  rtc.SetDateTime(
+    newTime);
+
+
+  Serial.println(
+    "DS1302 updated from NTP/system time.");
+
+
+  return true;
+}
+
+
+// ============================================================
+// CURRENT SYSTEM TIME VALIDATION
 // ============================================================
 
 bool isTimeValid() {
@@ -587,15 +870,16 @@ bool isTimeValid() {
   time_t now =
     time(nullptr);
 
+
   return now > 1577836800;
 }
 
 
 // ============================================================
-// CURRENT TIME IN SECONDS
+// MINUTES SINCE MIDNIGHT
 // ============================================================
 
-int secondsSinceMidnight() {
+int minutesSinceMidnight() {
 
   if (
     !isTimeValid())
@@ -615,7 +899,44 @@ int secondsSinceMidnight() {
     return -1;
 
 
-  return t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
+  return t->tm_hour * 60 + t->tm_min;
+}
+
+
+// ============================================================
+// SECONDS SINCE MIDNIGHT
+//
+// IMPORTANT:
+//
+// This is used for the actual brightness ramp.
+//
+// The original code used minutesSinceMidnight(),
+// meaning brightness could only change once every minute.
+//
+// This version uses seconds, producing a smooth ramp.
+// ============================================================
+
+long secondsSinceMidnight() {
+
+  if (
+    !isTimeValid())
+    return -1;
+
+
+  time_t now =
+    time(nullptr);
+
+
+  struct tm* t =
+    localtime(
+      &now);
+
+
+  if (!t)
+    return -1;
+
+
+  return (long)t->tm_hour * 3600L + (long)t->tm_min * 60L + t->tm_sec;
 }
 
 
@@ -661,82 +982,57 @@ String getTimeString() {
 
 // ============================================================
 // CALCULATE BRIGHTNESS
-//
-// Uses seconds instead of minutes.
-//
-// Example:
-//
-// Ramp up = 10 minutes
-//
-// 18:00:00 = 0%
-// 18:01:00 = 10%
-// 18:05:00 = 50%
-// 18:09:00 = 90%
-// 18:10:00 = 100%
-//
-// The function is called every 100 ms, so the actual PWM
-// transition is much smoother than a one-minute step.
 // ============================================================
 
 int calculateBrightness() {
 
-  if (
-    !isTimeValid())
-    return 0;
-
-
-  int nowSeconds =
+  long now =
     secondsSinceMidnight();
 
 
   if (
-    nowSeconds < 0)
+    now < 0)
     return 0;
 
 
-  int startSeconds =
-    settings.startHour * 3600 + settings.startMinute * 60;
+  long start =
+    (long)settings.startHour * 3600L + (long)settings.startMinute * 60L;
 
 
-  int durationSeconds =
-    settings.durationMinutes * 60;
+  long duration =
+    (long)settings.durationMinutes * 60L;
 
 
-  int rampUpSeconds =
-    settings.rampUpMinutes * 60;
+  long rampUp =
+    (long)settings.rampUpMinutes * 60L;
 
 
-  int rampDownSeconds =
-    settings.rampDownMinutes * 60;
+  long rampDown =
+    (long)settings.rampDownMinutes * 60L;
 
 
   // ----------------------------------------------------------
-  // Elapsed time since schedule start
+  // Calculate elapsed time from schedule start.
   //
-  // Handles crossing midnight.
+  // The modulo handles schedules crossing midnight.
   // ----------------------------------------------------------
 
-  int elapsed =
-    nowSeconds - startSeconds;
-
-
-  if (
-    elapsed < 0) {
-
-    elapsed +=
-      24 * 3600;
-  }
+  long elapsed =
+    (now - start + 86400L) % 86400L;
 
 
   // ----------------------------------------------------------
-  // Outside schedule
+  // 24-hour schedule
+  //
+  // If duration is 1440 minutes, the light remains scheduled
+  // for the entire day.
   // ----------------------------------------------------------
 
   if (
-    durationSeconds < 24 * 3600) {
+    settings.durationMinutes < 1440) {
 
     if (
-      elapsed >= durationSeconds) {
+      elapsed >= duration) {
 
       return 0;
     }
@@ -748,10 +1044,10 @@ int calculateBrightness() {
   // ----------------------------------------------------------
 
   if (
-    rampUpSeconds > 0 && elapsed < rampUpSeconds) {
+    rampUp > 0 && elapsed < rampUp) {
 
     float level =
-      (float)elapsed / (float)rampUpSeconds;
+      (float)elapsed / (float)rampUp;
 
 
     float brightness =
@@ -766,28 +1062,44 @@ int calculateBrightness() {
 
 
   // ----------------------------------------------------------
-  // RAMP DOWN
+  // If ramp-up is complete, light is at max brightness
+  // unless we are already in the ramp-down period.
   // ----------------------------------------------------------
 
-  int rampDownStart =
-    durationSeconds - rampDownSeconds;
-
-
   if (
-    rampDownSeconds > 0 && durationSeconds < 24 * 3600 && elapsed >= rampDownStart) {
+    settings.durationMinutes < 1440 && rampDown > 0) {
 
-    float remaining =
-      (float)(durationSeconds - elapsed) / (float)rampDownSeconds;
-
-
-    float brightness =
-      remaining * settings.maxBrightness;
+    long rampDownStart =
+      duration - rampDown;
 
 
-    return constrain(
-      (int)brightness,
-      0,
-      settings.maxBrightness);
+    // --------------------------------------------------------
+    // Protect against ramp-down being longer than duration.
+    // --------------------------------------------------------
+
+    if (
+      rampDownStart < 0) {
+
+      rampDownStart = 0;
+    }
+
+
+    if (
+      elapsed >= rampDownStart && elapsed < duration) {
+
+      float remaining =
+        (float)(duration - elapsed) / (float)rampDown;
+
+
+      float brightness =
+        remaining * settings.maxBrightness;
+
+
+      return constrain(
+        (int)brightness,
+        0,
+        settings.maxBrightness);
+    }
   }
 
 
@@ -819,6 +1131,7 @@ void updateLight() {
       setBrightness(
         0);
     }
+
 
     return;
   }
@@ -921,7 +1234,7 @@ String getScheduleOff() {
 
 
 // ============================================================
-// START ACCESS POINT
+// WIFI AP
 // ============================================================
 
 void startAccessPoint() {
@@ -938,7 +1251,8 @@ void startAccessPoint() {
     true;
 
 
-  WiFi.disconnect();
+  WiFi.disconnect(
+    true);
 
 
   delay(100);
@@ -950,14 +1264,12 @@ void startAccessPoint() {
 
   bool result =
     WiFi.softAP(
-      AP_NAME);
+      AP_NAME,
+      AP_PASSWORD);
 
-  // bool result =
-  //   WiFi.softAP(
-  //     AP_NAME,
-  //     AP_PASSWORD);
 
-  if (result) {
+  if (
+    result) {
 
     Serial.println(
       "Configuration AP started");
@@ -993,29 +1305,6 @@ void startAccessPoint() {
 
 
 // ============================================================
-// STOP ACCESS POINT
-// ============================================================
-
-void stopAccessPoint() {
-
-  if (!apMode)
-    return;
-
-
-  Serial.println(
-    "Stopping configuration AP");
-
-
-  WiFi.softAPdisconnect(
-    true);
-
-
-  apMode =
-    false;
-}
-
-
-// ============================================================
 // CONNECT TO SAVED WIFI
 // ============================================================
 
@@ -1043,8 +1332,18 @@ bool connectToWiFi() {
     wifiSSID);
 
 
+  apMode =
+    false;
+
+
   WiFi.mode(
     WIFI_STA);
+
+
+  WiFi.disconnect();
+
+
+  delay(100);
 
 
   WiFi.begin(
@@ -1057,7 +1356,7 @@ bool connectToWiFi() {
 
 
   while (
-    WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT) {
 
     delay(100);
 
@@ -1088,10 +1387,6 @@ bool connectToWiFi() {
       WiFi.RSSI());
 
 
-    apMode =
-      false;
-
-
     return true;
   }
 
@@ -1110,22 +1405,214 @@ bool connectToWiFi() {
 
 
 // ============================================================
-// INITIAL WIFI SETUP
+// START NTP
 // ============================================================
 
-void setupWiFi() {
-
-  bool hasWiFi =
-    loadWiFiCredentials();
-
+void startNTP() {
 
   if (
-    !hasWiFi) {
+    WiFi.status() != WL_CONNECTED) {
 
-    startAccessPoint();
+    Serial.println(
+      "NTP skipped - no WiFi.");
 
     return;
   }
+
+
+  Serial.println();
+  Serial.println(
+    "Starting NTP synchronization...");
+
+
+  // ----------------------------------------------------------
+  // Philippines timezone
+  //
+  // PHT-8 means UTC+8 in POSIX TZ notation.
+  // ----------------------------------------------------------
+
+  setenv(
+    "TZ",
+    "PHT-8",
+    1);
+
+  tzset();
+
+
+  // ----------------------------------------------------------
+  // Configure NTP.
+  //
+  // The ESP system clock will be synchronized by NTP.
+  // ----------------------------------------------------------
+
+  configTime(
+    8 * 3600,
+    0,
+    "ph.pool.ntp.org",
+    "time.nist.gov",
+    "time.google.com");
+
+
+  ntpStarted =
+    true;
+
+  ntpSynchronized =
+    false;
+
+  ntpStartMillis =
+    millis();
+
+
+  Serial.println(
+    "NTP started.");
+}
+
+
+// ============================================================
+// CHECK NTP
+//
+// Once NTP obtains valid time:
+//
+//     ESP system time
+//             |
+//             v
+//         DS1302 RTC
+//
+// ============================================================
+
+void checkNTP() {
+
+  if (
+    !ntpStarted)
+    return;
+
+
+  if (
+    millis() - lastNtpCheck < NTP_CHECK_INTERVAL)
+    return;
+
+
+  lastNtpCheck =
+    millis();
+
+
+  if (
+    ntpSynchronized)
+    return;
+
+
+  if (
+    isTimeValid()) {
+
+    Serial.println();
+    Serial.println(
+      "====================================");
+
+    Serial.println(
+      "NTP TIME SYNCHRONIZED");
+
+
+    Serial.print(
+      "Correct time: ");
+
+    Serial.println(
+      getTimeString());
+
+
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Save corrected NTP time to DS1302.
+    // --------------------------------------------------------
+
+    updateRTCFromSystemTime();
+
+
+    ntpSynchronized =
+      true;
+
+
+    Serial.println(
+      "RTC synchronization complete.");
+
+    Serial.println(
+      "====================================");
+
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // NTP timeout
+  //
+  // RTC time continues to be used.
+  // ----------------------------------------------------------
+
+  if (
+    millis() - ntpStartMillis > NTP_SYNC_TIMEOUT) {
+
+    Serial.println(
+      "NTP synchronization timeout.");
+
+    Serial.println(
+      "Continuing using DS1302 time.");
+
+
+    ntpSynchronized =
+      true;
+  }
+}
+
+
+// ============================================================
+// WIFI RECONNECT
+// ============================================================
+
+void checkWiFiConnection() {
+
+  // ----------------------------------------------------------
+  // Don't retry while in AP mode if we don't have credentials.
+  // ----------------------------------------------------------
+
+  if (
+    wifiSSID.length() == 0)
+    return;
+
+
+  // ----------------------------------------------------------
+  // Already connected
+  // ----------------------------------------------------------
+
+  if (
+    WiFi.status() == WL_CONNECTED) {
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Retry periodically
+  // ----------------------------------------------------------
+
+  if (
+    millis() - lastWiFiRetry < WIFI_RETRY_INTERVAL) {
+
+    return;
+  }
+
+
+  lastWiFiRetry =
+    millis();
+
+
+  Serial.println();
+  Serial.println(
+    "WiFi connection lost.");
+
+
+  Serial.println(
+    "Attempting saved WiFi again...");
 
 
   bool connected =
@@ -1135,223 +1622,24 @@ void setupWiFi() {
   if (
     connected) {
 
-    apMode =
-      false;
-
-    return;
-  }
-
-
-  // ----------------------------------------------------------
-  // Saved SSID unavailable / wrong password / connection fail
-  // ----------------------------------------------------------
-
-  Serial.println(
-    "Saved WiFi unavailable.");
-
-  Serial.println(
-    "Starting configuration AP.");
-
-
-  startAccessPoint();
-}
-
-
-// ============================================================
-// AUTOMATIC WIFI MANAGEMENT
-// ============================================================
-
-void updateWiFi() {
-
-  // ----------------------------------------------------------
-  // No saved credentials
-  // ----------------------------------------------------------
-
-  if (
-    wifiSSID.length() == 0) {
-
-    if (
-      !apMode) {
-
-      startAccessPoint();
-    }
-
-    return;
-  }
-
-
-  // ----------------------------------------------------------
-  // Currently connected
-  // ----------------------------------------------------------
-
-  if (
-    WiFi.status() == WL_CONNECTED) {
-
-    // If station is connected, no need for AP.
-    return;
-  }
-
-
-  // ----------------------------------------------------------
-  // AP MODE
-  //
-  // Keep AP available while periodically trying the saved
-  // network again.
-  // ----------------------------------------------------------
-
-  if (
-    apMode) {
-
-    if (
-      millis() - lastAPRetryAttempt >= WIFI_AP_RETRY_INTERVAL_MS) {
-
-      lastAPRetryAttempt =
-        millis();
-
-
-      Serial.println();
-      Serial.println(
-        "Retrying saved WiFi while AP is active...");
-
-
-      WiFi.mode(
-        WIFI_STA);
-
-
-      WiFi.begin(
-        wifiSSID.c_str(),
-        wifiPassword.c_str());
-
-
-      unsigned long start =
-        millis();
-
-
-      while (
-        WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-
-        server.handleClient();
-
-        checkWiFiButton();
-
-        updateLight();
-
-        delay(100);
-
-        yield();
-      }
-
-
-      if (
-        WiFi.status() == WL_CONNECTED) {
-
-        Serial.println();
-        Serial.println(
-          "WiFi connection restored.");
-
-
-        Serial.print(
-          "IP: ");
-
-        Serial.println(
-          WiFi.localIP());
-
-
-        apMode =
-          false;
-
-
-        return;
-      }
-
-
-      Serial.println(
-        "Saved WiFi still unavailable.");
-
-      startAccessPoint();
-
-      return;
-    }
-
-
-    return;
-  }
-
-
-  // ----------------------------------------------------------
-  // NORMAL STATION MODE BUT DISCONNECTED
-  // ----------------------------------------------------------
-
-  if (
-    millis() - lastWiFiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
-
-    lastWiFiReconnectAttempt =
-      millis();
-
-
-    Serial.println();
     Serial.println(
-      "WiFi disconnected.");
+      "WiFi reconnected.");
+
+
+    startNTP();
+
+  } else {
+
+    // --------------------------------------------------------
+    // If WiFi cannot be connected, use AP mode.
+    // --------------------------------------------------------
 
     Serial.println(
-      "Attempting automatic reconnection...");
-
-
-    WiFi.disconnect();
-
-
-    delay(100);
-
-
-    WiFi.mode(
-      WIFI_STA);
-
-
-    WiFi.begin(
-      wifiSSID.c_str(),
-      wifiPassword.c_str());
-
-
-    unsigned long start =
-      millis();
-
-
-    while (
-      WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-
-      server.handleClient();
-
-      checkWiFiButton();
-
-      updateLight();
-
-      delay(100);
-
-      yield();
-    }
-
-
-    if (
-      WiFi.status() == WL_CONNECTED) {
-
-      Serial.println(
-        "WiFi reconnected!");
-
-      Serial.print(
-        "IP: ");
-
-      Serial.println(
-        WiFi.localIP());
-
-      return;
-    }
+      "Unable to reconnect.");
 
 
     Serial.println(
-      "Reconnection failed.");
-
-    Serial.println(
-      "Falling back to AP mode.");
+      "Returning to GXDE AP mode.");
 
 
     startAccessPoint();
@@ -1365,6 +1653,7 @@ void updateWiFi() {
 
 const char WIFI_HTML[] PROGMEM =
   R"rawliteral(
+
 <!DOCTYPE html>
 
 <html>
@@ -1567,6 +1856,7 @@ font-size:12px;
 color:#00ff9c;
 }
 
+
 .passwordRow {
 
 display:flex;
@@ -1578,14 +1868,17 @@ gap:0;
 margin-top:7px;
 }
 
+
 .passwordRow input {
 
 flex:1;
 
 margin-top:0;
 
-border-radius:6px 0 0 6px;
+border-radius:
+6px 0 0 6px;
 }
+
 
 .passwordToggle {
 
@@ -1601,7 +1894,8 @@ padding:0;
 
 border-left:none;
 
-border-radius:0 6px 6px 0;
+border-radius:
+0 6px 6px 0;
 
 display:flex;
 
@@ -1612,11 +1906,14 @@ justify-content:center;
 cursor:pointer;
 }
 
+
 .passwordToggle svg {
 
 width:20px;
 
 height:20px;
+
+fill:#001b18;
 }
 
 </style>
@@ -1644,9 +1941,11 @@ the controller will remain unchanged.
 
 </div>
 
+
 <form
 action="/wifi/save"
 method="POST">
+
 
 <div class="card">
 
@@ -1678,6 +1977,7 @@ style="margin-top:10px">
 
 </div>
 
+
 <div class="card">
 
 <label>
@@ -1696,7 +1996,6 @@ placeholder="Wi-Fi password">
 type="button"
 id="passwordButton"
 class="passwordToggle"
-aria-label="Toggle password visibility"
 onclick="togglePassword()">
 
 <svg
@@ -1704,7 +2003,7 @@ id="eyeIcon"
 viewBox="0 0 24 24">
 
 <path
-d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.01-.16c0-1.66-1.34-3-3-3l-.16.01z"/>
+d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
 
 </svg>
 
@@ -1714,6 +2013,7 @@ d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 
 
 </div>
 
+
 <button
 type="submit">
 
@@ -1721,11 +2021,11 @@ SAVE WIFI & RESTART
 
 </button>
 
+
 </form>
 
-<div id="message"></div>
-
 </div>
+
 
 <script>
 
@@ -1733,7 +2033,8 @@ const eyeOpenPath =
 "M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z";
 
 const eyeClosedPath =
-"M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.01-.16c0-1.66-1.34-3-3-3l-.16.01z";
+"M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.01-.16c0-1.66-1.34-3-3-3l-.16.01z";
+
 
 function togglePassword(){
 
@@ -1787,27 +2088,38 @@ async function scanNetworks(){
     let networks =
       await r.json();
 
+
     let select =
       document.getElementById(
         "ssid"
       );
 
+
     networks.forEach(
       function(network){
+
+        if(
+          !network.ssid
+        )
+          return;
+
 
         let option =
           document.createElement(
             "option"
           );
 
+
         option.value =
           network.ssid;
+
 
         option.text =
           network.ssid +
           " (" +
           network.rssi +
           " dBm)";
+
 
         select.appendChild(
           option
@@ -1829,9 +2141,11 @@ async function scanNetworks(){
       }
     );
 
+
   }catch(e){
 
     console.log(e);
+
   }
 }
 
@@ -1843,6 +2157,7 @@ scanNetworks();
 </body>
 
 </html>
+
 )rawliteral";
 
 
@@ -1852,6 +2167,7 @@ scanNetworks();
 
 const char INDEX_HTML[] PROGMEM =
   R"rawliteral(
+
 <!DOCTYPE html>
 
 <html>
@@ -2204,6 +2520,7 @@ LIGHT OFF
 
 </div>
 
+
 <div class="card">
 
 <div class="title">
@@ -2217,6 +2534,7 @@ type="time"
 id="start">
 
 </div>
+
 
 <div class="card">
 
@@ -2241,6 +2559,7 @@ value="720">
 
 </div>
 
+
 <div class="card">
 
 <div class="title">
@@ -2263,6 +2582,7 @@ max="100"
 value="100">
 
 </div>
+
 
 <div class="card">
 
@@ -2287,6 +2607,7 @@ value="10">
 
 </div>
 
+
 <div class="card">
 
 <div class="title">
@@ -2310,6 +2631,7 @@ value="10">
 
 </div>
 
+
 <div class="card schedule">
 
 <div>
@@ -2328,6 +2650,7 @@ OFF:
 </div>
 
 </div>
+
 
 <div class="buttons">
 
@@ -2350,6 +2673,7 @@ SAVE SETTINGS
 
 </div>
 
+
 <div
 class="saveStatus"
 id="saveStatus">
@@ -2358,11 +2682,13 @@ SETTINGS SAVED
 
 </div>
 
+
 <div class="footer">
 GXDE LIGHT CONTROLLER
 </div>
 
 </div>
+
 
 <script>
 
@@ -2461,7 +2787,9 @@ function updateSchedule(){
     $("start").value;
 
 
-  if(!startValue){
+  if(
+    !startValue
+  ){
 
     $("scheduleStart").innerText =
       "--:--";
@@ -2528,7 +2856,9 @@ async function loadSettings(){
       );
 
 
-    if(!response.ok)
+    if(
+      !response.ok
+    )
       return;
 
 
@@ -2566,7 +2896,6 @@ async function loadSettings(){
 
     updateValues();
 
-    updateSchedule();
 
   }catch(e){
 
@@ -2607,6 +2936,7 @@ async function update(){
           ? "ON"
           : "OFF"
       );
+
 
   }catch(e){
 
@@ -2651,7 +2981,9 @@ async function save(){
       );
 
 
-    if(!response.ok){
+    if(
+      !response.ok
+    ){
 
       alert(
         "Failed to save settings"
@@ -2665,7 +2997,9 @@ async function save(){
       await response.json();
 
 
-    if(data.success){
+    if(
+      data.success
+    ){
 
       await loadSettings();
 
@@ -2787,6 +3121,7 @@ setInterval(
 </body>
 
 </html>
+
 )rawliteral";
 
 
@@ -2946,10 +3281,12 @@ void handleSave() {
   // ----------------------------------------------------------
 
   if (
-    server.hasArg("start")) {
+    server.hasArg(
+      "start")) {
 
     String t =
-      server.arg("start");
+      server.arg(
+        "start");
 
 
     if (
@@ -3078,36 +3415,6 @@ void handleSave() {
 
 
   // ----------------------------------------------------------
-  // Prevent ramp overlap
-  // ----------------------------------------------------------
-
-  if (
-    settings.durationMinutes < 1440) {
-
-    if (
-      settings.rampUpMinutes > settings.durationMinutes) {
-
-      settings.rampUpMinutes =
-        settings.durationMinutes;
-    }
-
-
-    int remaining =
-      settings.durationMinutes - settings.rampUpMinutes;
-
-
-    if (
-      settings.rampDownMinutes > remaining) {
-
-      settings.rampDownMinutes =
-        max(
-          0,
-          remaining);
-    }
-  }
-
-
-  // ----------------------------------------------------------
   // SAVE
   // ----------------------------------------------------------
 
@@ -3115,10 +3422,9 @@ void handleSave() {
     saveSettings();
 
 
-  // Saving settings returns control to automatic mode.
-
   manualMode =
     false;
+
 
   manualState =
     false;
@@ -3153,9 +3459,7 @@ void handleSave() {
     success
       ? 200
       : 500,
-
     "application/json",
-
     json);
 }
 
@@ -3218,14 +3522,23 @@ void handleWiFiScan() {
     i < count;
     i++) {
 
-    if (
-      i > 0)
-      json += ",";
-
-
     String name =
       WiFi.SSID(i);
 
+
+    if (
+      name.length() == 0)
+      continue;
+
+
+    if (
+      json.length() > 1)
+      json += ",";
+
+
+    // --------------------------------------------------------
+    // Basic JSON escaping
+    // --------------------------------------------------------
 
     name.replace(
       "\\",
@@ -3278,7 +3591,7 @@ void handleWiFiSave() {
 
 
   // ----------------------------------------------------------
-  // Manual SSID has priority.
+  // Manual SSID has priority
   // ----------------------------------------------------------
 
   if (
@@ -3307,10 +3620,6 @@ void handleWiFiSave() {
     ssid.trim();
   }
 
-
-  // ----------------------------------------------------------
-  // Password
-  // ----------------------------------------------------------
 
   if (
     server.hasArg(
@@ -3381,7 +3690,7 @@ void handleWiFiSave() {
 
 
   // ----------------------------------------------------------
-  // Response before restart
+  // Send response before restart
   // ----------------------------------------------------------
 
   server.send(
@@ -3411,73 +3720,6 @@ void handleWiFiSave() {
 
 
 // ============================================================
-// NTP
-// ============================================================
-
-void setupNTP() {
-
-  if (
-    WiFi.status() != WL_CONNECTED) {
-
-    Serial.println(
-      "NTP waiting for WiFi.");
-
-    return;
-  }
-
-
-  Serial.println(
-    "Configuring NTP...");
-
-
-  // Philippines UTC+8
-
-  configTime(
-    8 * 3600,
-    0,
-    "pool.ntp.org",
-    "time.nist.gov",
-    "time.google.com");
-
-
-  Serial.println(
-    "NTP configured");
-}
-
-
-// ============================================================
-// CHECK NTP AFTER WIFI RECOVERY
-// ============================================================
-
-void checkNTP() {
-
-  static bool wasConnected =
-    false;
-
-
-  bool connected =
-    WiFi.status() == WL_CONNECTED;
-
-
-  if (
-    connected && !wasConnected) {
-
-    Serial.println(
-      "WiFi connection available.");
-
-    Serial.println(
-      "Refreshing NTP configuration.");
-
-    setupNTP();
-  }
-
-
-  wasConnected =
-    connected;
-}
-
-
-// ============================================================
 // FLASH BUTTON RESET
 // ============================================================
 
@@ -3500,6 +3742,10 @@ void resetWiFiFromButton() {
     "FLASH BUTTON WIFI RESET");
 
 
+  // ----------------------------------------------------------
+  // Delete only WiFi credentials.
+  // ----------------------------------------------------------
+
   deleteWiFiCredentials();
 
 
@@ -3510,6 +3756,10 @@ void resetWiFiFromButton() {
   Serial.println(
     "Release FLASH button.");
 
+
+  // ----------------------------------------------------------
+  // Wait for release.
+  // ----------------------------------------------------------
 
   unsigned long releaseStart =
     millis();
@@ -3564,7 +3814,7 @@ void checkWiFiButton() {
 
 
   // ----------------------------------------------------------
-  // Don't arm while button is held during boot.
+  // Don't arm while held during boot
   // ----------------------------------------------------------
 
   if (
@@ -3579,6 +3829,7 @@ void checkWiFiButton() {
       wifiButtonPrevious =
         HIGH;
     }
+
 
     return;
   }
@@ -3649,7 +3900,7 @@ void checkWiFiButton() {
 
 
 // ============================================================
-// WEB SERVER ROUTES
+// SETUP WEB SERVER ROUTES
 // ============================================================
 
 void setupWebServer() {
@@ -3700,6 +3951,74 @@ void setupWebServer() {
 
 
 // ============================================================
+// SETUP RTC
+// ============================================================
+
+void setupRTC() {
+
+  Serial.println();
+  Serial.println(
+    "Initializing DS1302...");
+
+
+  rtc.Begin();
+
+
+  // ----------------------------------------------------------
+  // Read RTC immediately.
+  //
+  // This allows the ESP to have a valid time even before
+  // WiFi/NTP becomes available.
+  // ----------------------------------------------------------
+
+  if (
+    rtc.IsDateTimeValid()) {
+
+    Serial.println(
+      "DS1302 contains valid time.");
+
+
+    setSystemTimeFromRTC();
+
+  } else {
+
+    Serial.println(
+      "WARNING: DS1302 does not contain valid time.");
+
+
+    Serial.println(
+      "NTP will be required to establish correct time.");
+  }
+
+
+  // ----------------------------------------------------------
+  // Check oscillator
+  // ----------------------------------------------------------
+
+  if (
+    rtc.GetIsRunning()) {
+
+    Serial.println(
+      "DS1302 oscillator is running.");
+
+  } else {
+
+    Serial.println(
+      "DS1302 oscillator was stopped.");
+
+
+    // Start it.
+    rtc.SetIsRunning(
+      true);
+
+
+    Serial.println(
+      "DS1302 oscillator started.");
+  }
+}
+
+
+// ============================================================
 // SETUP
 // ============================================================
 
@@ -3718,6 +4037,9 @@ void setup() {
 
   Serial.println(
     "GXDE LIGHT CONTROLLER");
+
+  Serial.println(
+    "DS1302 + NTP VERSION");
 
   Serial.println(
     "====================================");
@@ -3758,6 +4080,7 @@ void setup() {
     PWM_MAX);
 
 
+  // Make sure light is OFF during startup.
   setBrightness(
     0);
 
@@ -3788,17 +4111,57 @@ void setup() {
 
 
   // ==========================================================
+  // RTC
+  // ==========================================================
+
+  setupRTC();
+
+
+  // ==========================================================
+  // LOAD WIFI
+  // ==========================================================
+
+  bool hasWiFi =
+    loadWiFiCredentials();
+
+
+  // ==========================================================
   // WIFI
   // ==========================================================
 
-  setupWiFi();
+  bool connected =
+    false;
 
 
-  // ==========================================================
-  // NTP
-  // ==========================================================
+  if (
+    hasWiFi) {
 
-  setupNTP();
+    connected =
+      connectToWiFi();
+  }
+
+
+  // ----------------------------------------------------------
+  // No WiFi or connection failed
+  // ----------------------------------------------------------
+
+  if (
+    !connected) {
+
+    startAccessPoint();
+
+  } else {
+
+    apMode =
+      false;
+
+
+    // --------------------------------------------------------
+    // NTP
+    // --------------------------------------------------------
+
+    startNTP();
+  }
 
 
   // ==========================================================
@@ -3824,6 +4187,13 @@ void setup() {
 
 
   // ==========================================================
+  // INITIAL LIGHT UPDATE
+  // ==========================================================
+
+  updateLight();
+
+
+  // ==========================================================
   // READY
   // ==========================================================
 
@@ -3839,11 +4209,14 @@ void setup() {
   Serial.print(
     "Schedule: ");
 
+
   Serial.print(
     getScheduleStart());
 
+
   Serial.print(
     " -> ");
+
 
   Serial.println(
     getScheduleOff());
@@ -3852,8 +4225,30 @@ void setup() {
   Serial.print(
     "Full brightness: ");
 
+
   Serial.println(
     getScheduleFullBrightness());
+
+
+  Serial.print(
+    "Current time: ");
+
+
+  Serial.println(
+    getTimeString());
+
+
+  if (
+    isRTCValid()) {
+
+    Serial.println(
+      "RTC status: VALID");
+
+  } else {
+
+    Serial.println(
+      "RTC status: INVALID");
+  }
 
 
   if (
@@ -3867,6 +4262,7 @@ void setup() {
     Serial.print(
       "Connect to: ");
 
+
     Serial.println(
       AP_NAME);
 
@@ -3874,12 +4270,14 @@ void setup() {
     Serial.print(
       "Password: ");
 
+
     Serial.println(
       AP_PASSWORD);
 
 
     Serial.print(
       "Open: http://");
+
 
     Serial.println(
       WiFi.softAPIP());
@@ -3889,6 +4287,7 @@ void setup() {
     Serial.println();
     Serial.print(
       "GXDE IP: ");
+
 
     Serial.println(
       WiFi.localIP());
@@ -3926,27 +4325,29 @@ void loop() {
 
 
   // ----------------------------------------------------------
-  // WiFi management
-  // ----------------------------------------------------------
-
-  updateWiFi();
-
-
-  // ----------------------------------------------------------
-  // NTP after WiFi recovery
+  // NTP
   // ----------------------------------------------------------
 
   checkNTP();
 
 
   // ----------------------------------------------------------
-  // LIGHT
+  // WiFi monitoring
+  // ----------------------------------------------------------
+
+  checkWiFiConnection();
+
+
+  // ----------------------------------------------------------
+  // Update light every 1 second
   //
-  // Update every 100 ms.
+  // The brightness calculation itself is based on SECONDS,
+  // so the schedule is accurate even though the output is
+  // refreshed once per second.
   // ----------------------------------------------------------
 
   if (
-    millis() - lastLightUpdate >= LIGHT_UPDATE_INTERVAL_MS) {
+    millis() - lastLightUpdate >= 1000) {
 
     lastLightUpdate =
       millis();
