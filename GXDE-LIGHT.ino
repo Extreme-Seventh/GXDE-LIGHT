@@ -1,19 +1,22 @@
 /*
+   ============================================================
    GXDE LIGHT CONTROLLER
    ESP8266 / NodeMCU V3
-
    ============================================================
+
    FEATURES
-   ============================================================
-
+   ------------------------------------------------------------
    - NTP real-time clock
    - Philippines UTC+8
    - User-defined start time
    - User-defined ON duration
-   - Ramp up / ramp down
+   - Smooth ramp up
+   - Smooth ramp down
    - Maximum brightness
    - Lighting settings saved to LittleFS
    - Wi-Fi credentials saved separately to LittleFS
+   - Automatic Wi-Fi reconnection
+   - Automatic AP fallback if Wi-Fi cannot connect
    - Automatic recovery after power interruption
    - Responsive web UI
    - Manual ON/OFF
@@ -22,75 +25,28 @@
    - Built-in Wi-Fi provisioning AP
    - FLASH button Wi-Fi credential reset
 
-   ============================================================
-   WIFI SYSTEM
-   ============================================================
+   HARDWARE
+   ------------------------------------------------------------
+   PWM output:
+       D5 / GPIO14
 
-   Normal operation:
+   FLASH button:
+       GPIO0
 
-       Saved Wi-Fi credentials
-              |
-              v
-       Connect to Wi-Fi
-              |
-              v
-       GXDE web interface
+   MOSFET:
+       PWM controlled from D5
 
+   IMPORTANT
+   ------------------------------------------------------------
+   GPIO0 is the ESP8266 boot strap pin.
 
-   If no Wi-Fi credentials exist:
+   Release the FLASH button before the ESP restarts.
 
-       ESP starts:
-       GXDE-LIGHT
+   Wi-Fi credentials:
+       /wifi.txt
 
-       AP password:
-       12345678
-
-       Configuration page:
-       http://192.168.4.1
-
-
-   If saved Wi-Fi cannot connect:
-
-       ESP automatically starts:
-       GXDE-LIGHT
-
-
-   ============================================================
-   FLASH BUTTON
-   ============================================================
-
-   NodeMCU FLASH button = GPIO0
-
-   Hold FLASH for 5 seconds:
-
-       1. Delete /wifi.txt
-       2. Keep /settings.txt
-       3. Wait for button release
-       4. Restart ESP8266
-       5. Next boot starts GXDE-LIGHT AP
-
-
-   IMPORTANT:
-
-   GPIO0 is also the ESP8266 boot strap pin.
-
-   Release FLASH before the ESP restarts.
-
-
-   ============================================================
-   FILE SYSTEM
-   ============================================================
-
-   /settings.txt
-
-       Lighting settings
-
-
-   /wifi.txt
-
-       Wi-Fi SSID
-       Wi-Fi password
-
+   Lighting settings:
+       /settings.txt
 
    Wi-Fi reset NEVER deletes lighting settings.
 */
@@ -109,7 +65,6 @@
 
 #define PWM_PIN D5
 
-// NodeMCU FLASH button
 #define WIFI_BUTTON_PIN 0
 
 #define PWM_MAX 1023
@@ -124,6 +79,28 @@ const char* AP_NAME =
 
 const char* AP_PASSWORD =
   "12345678";
+
+
+// ============================================================
+// WIFI TIMING
+// ============================================================
+
+const unsigned long WIFI_CONNECT_TIMEOUT_MS =
+  8000;
+
+const unsigned long WIFI_RECONNECT_INTERVAL_MS =
+  10000;
+
+const unsigned long WIFI_AP_RETRY_INTERVAL_MS =
+  30000;
+
+
+// ============================================================
+// LIGHT UPDATE
+// ============================================================
+
+const unsigned long LIGHT_UPDATE_INTERVAL_MS =
+  100;
 
 
 // ============================================================
@@ -162,6 +139,9 @@ String wifiPassword = "";
 
 bool apMode = false;
 
+unsigned long lastWiFiReconnectAttempt = 0;
+unsigned long lastAPRetryAttempt = 0;
+
 
 // ============================================================
 // RUNTIME
@@ -172,7 +152,7 @@ bool manualState = false;
 
 int currentBrightness = 0;
 
-unsigned long lastUpdate = 0;
+unsigned long lastLightUpdate = 0;
 
 
 // ============================================================
@@ -194,7 +174,7 @@ const unsigned long WIFI_BUTTON_HOLD_MS =
 
 
 // ============================================================
-// DEFAULT LIGHT SETTINGS
+// DEFAULT SETTINGS
 // ============================================================
 
 void defaultSettings() {
@@ -206,6 +186,7 @@ void defaultSettings() {
     12 * 60;
 
   settings.rampUpMinutes = 10;
+
   settings.rampDownMinutes = 10;
 
   settings.maxBrightness = 100;
@@ -221,47 +202,40 @@ bool saveSettings() {
   File file =
     LittleFS.open(
       "/settings.txt",
-      "w"
-    );
+      "w");
 
   if (!file) {
 
     Serial.println(
-      "ERROR: Cannot open settings.txt"
-    );
+      "ERROR: Cannot open settings.txt");
 
     return false;
   }
 
-  file.println(
-    settings.startHour
-  );
 
   file.println(
-    settings.startMinute
-  );
+    settings.startHour);
 
   file.println(
-    settings.durationMinutes
-  );
+    settings.startMinute);
 
   file.println(
-    settings.rampUpMinutes
-  );
+    settings.durationMinutes);
 
   file.println(
-    settings.rampDownMinutes
-  );
+    settings.rampUpMinutes);
 
   file.println(
-    settings.maxBrightness
-  );
+    settings.rampDownMinutes);
+
+  file.println(
+    settings.maxBrightness);
 
   file.close();
 
+
   Serial.println(
-    "Lighting settings saved"
-  );
+    "Lighting settings saved");
 
   return true;
 }
@@ -275,17 +249,13 @@ bool loadSettings() {
 
   if (
     !LittleFS.exists(
-      "/settings.txt"
-    )
-  ) {
+      "/settings.txt")) {
 
     Serial.println(
-      "No lighting settings found"
-    );
+      "No lighting settings found");
 
     Serial.println(
-      "Using defaults"
-    );
+      "Using defaults");
 
     defaultSettings();
 
@@ -298,14 +268,12 @@ bool loadSettings() {
   File file =
     LittleFS.open(
       "/settings.txt",
-      "r"
-    );
+      "r");
 
   if (!file) {
 
     Serial.println(
-      "ERROR: Cannot read settings"
-    );
+      "ERROR: Cannot read settings");
 
     defaultSettings();
 
@@ -314,28 +282,22 @@ bool loadSettings() {
 
 
   settings.startHour =
-    file.readStringUntil('\n')
-      .toInt();
+    file.readStringUntil('\n').toInt();
 
   settings.startMinute =
-    file.readStringUntil('\n')
-      .toInt();
+    file.readStringUntil('\n').toInt();
 
   settings.durationMinutes =
-    file.readStringUntil('\n')
-      .toInt();
+    file.readStringUntil('\n').toInt();
 
   settings.rampUpMinutes =
-    file.readStringUntil('\n')
-      .toInt();
+    file.readStringUntil('\n').toInt();
 
   settings.rampDownMinutes =
-    file.readStringUntil('\n')
-      .toInt();
+    file.readStringUntil('\n').toInt();
 
   settings.maxBrightness =
-    file.readStringUntil('\n')
-      .toInt();
+    file.readStringUntil('\n').toInt();
 
   file.close();
 
@@ -348,48 +310,71 @@ bool loadSettings() {
     constrain(
       settings.startHour,
       0,
-      23
-    );
+      23);
 
   settings.startMinute =
     constrain(
       settings.startMinute,
       0,
-      59
-    );
+      59);
 
   settings.durationMinutes =
     constrain(
       settings.durationMinutes,
       1,
-      1440
-    );
+      1440);
 
   settings.rampUpMinutes =
     constrain(
       settings.rampUpMinutes,
       0,
-      120
-    );
+      120);
 
   settings.rampDownMinutes =
     constrain(
       settings.rampDownMinutes,
       0,
-      120
-    );
+      120);
 
   settings.maxBrightness =
     constrain(
       settings.maxBrightness,
       1,
-      100
-    );
+      100);
+
+
+  // ----------------------------------------------------------
+  // Prevent ramps from overlapping
+  // ----------------------------------------------------------
+
+  if (
+    settings.durationMinutes < 1440) {
+
+    if (
+      settings.rampUpMinutes > settings.durationMinutes) {
+
+      settings.rampUpMinutes =
+        settings.durationMinutes;
+    }
+
+
+    int remaining =
+      settings.durationMinutes - settings.rampUpMinutes;
+
+
+    if (
+      settings.rampDownMinutes > remaining) {
+
+      settings.rampDownMinutes =
+        max(
+          0,
+          remaining);
+    }
+  }
 
 
   Serial.println(
-    "Lighting settings loaded"
-  );
+    "Lighting settings loaded");
 
   return true;
 }
@@ -401,32 +386,27 @@ bool loadSettings() {
 
 bool saveWiFiCredentials(
   String ssid,
-  String password
-) {
+  String password) {
 
   File file =
     LittleFS.open(
       "/wifi.txt",
-      "w"
-    );
+      "w");
 
   if (!file) {
 
     Serial.println(
-      "ERROR: Cannot save WiFi credentials"
-    );
+      "ERROR: Cannot save WiFi credentials");
 
     return false;
   }
 
 
   file.println(
-    ssid
-  );
+    ssid);
 
   file.println(
-    password
-  );
+    password);
 
   file.close();
 
@@ -439,8 +419,7 @@ bool saveWiFiCredentials(
 
 
   Serial.println(
-    "WiFi credentials saved"
-  );
+    "WiFi credentials saved");
 
   return true;
 }
@@ -454,13 +433,10 @@ bool loadWiFiCredentials() {
 
   if (
     !LittleFS.exists(
-      "/wifi.txt"
-    )
-  ) {
+      "/wifi.txt")) {
 
     Serial.println(
-      "No saved WiFi credentials"
-    );
+      "No saved WiFi credentials");
 
     wifiSSID = "";
     wifiPassword = "";
@@ -472,14 +448,12 @@ bool loadWiFiCredentials() {
   File file =
     LittleFS.open(
       "/wifi.txt",
-      "r"
-    );
+      "r");
 
   if (!file) {
 
     Serial.println(
-      "ERROR: Cannot read wifi.txt"
-    );
+      "ERROR: Cannot read wifi.txt");
 
     wifiSSID = "";
     wifiPassword = "";
@@ -502,8 +476,7 @@ bool loadWiFiCredentials() {
 
 
   if (
-    wifiSSID.length() == 0
-  ) {
+    wifiSSID.length() == 0) {
 
     wifiSSID = "";
     wifiPassword = "";
@@ -513,12 +486,10 @@ bool loadWiFiCredentials() {
 
 
   Serial.print(
-    "Saved WiFi SSID: "
-  );
+    "Saved WiFi SSID: ");
 
   Serial.println(
-    wifiSSID
-  );
+    wifiSSID);
 
   return true;
 }
@@ -532,41 +503,33 @@ void deleteWiFiCredentials() {
 
   Serial.println();
   Serial.println(
-    "===================================="
-  );
+    "====================================");
 
   Serial.println(
-    "ERASING WIFI CREDENTIALS"
-  );
+    "ERASING WIFI CREDENTIALS");
+
 
   if (
     LittleFS.exists(
-      "/wifi.txt"
-    )
-  ) {
+      "/wifi.txt")) {
 
     if (
       LittleFS.remove(
-        "/wifi.txt"
-      )
-    ) {
+        "/wifi.txt")) {
 
       Serial.println(
-        "wifi.txt deleted"
-      );
+        "wifi.txt deleted");
 
     } else {
 
       Serial.println(
-        "ERROR: Failed to delete wifi.txt"
-      );
+        "ERROR: Failed to delete wifi.txt");
     }
 
   } else {
 
     Serial.println(
-      "No wifi.txt found"
-    );
+      "No wifi.txt found");
   }
 
 
@@ -575,12 +538,10 @@ void deleteWiFiCredentials() {
 
 
   Serial.println(
-    "Lighting settings were NOT changed."
-  );
+    "Lighting settings were NOT changed.");
 
   Serial.println(
-    "===================================="
-  );
+    "====================================");
 }
 
 
@@ -589,15 +550,14 @@ void deleteWiFiCredentials() {
 // ============================================================
 
 void setBrightness(
-  int percent
-) {
+  int percent) {
 
   percent =
     constrain(
       percent,
       0,
-      100
-    );
+      100);
+
 
   currentBrightness =
     percent;
@@ -609,14 +569,12 @@ void setBrightness(
       0,
       100,
       0,
-      PWM_MAX
-    );
+      PWM_MAX);
 
 
   analogWrite(
     PWM_PIN,
-    pwm
-  );
+    pwm);
 }
 
 
@@ -629,20 +587,18 @@ bool isTimeValid() {
   time_t now =
     time(nullptr);
 
-  return
-    now > 1577836800;
+  return now > 1577836800;
 }
 
 
 // ============================================================
-// MINUTES SINCE MIDNIGHT
+// CURRENT TIME IN SECONDS
 // ============================================================
 
-int minutesSinceMidnight() {
+int secondsSinceMidnight() {
 
   if (
-    !isTimeValid()
-  )
+    !isTimeValid())
     return -1;
 
 
@@ -652,29 +608,25 @@ int minutesSinceMidnight() {
 
   struct tm* t =
     localtime(
-      &now
-    );
+      &now);
 
 
   if (!t)
     return -1;
 
 
-  return
-    t->tm_hour * 60 +
-    t->tm_min;
+  return t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
 }
 
 
 // ============================================================
-// CURRENT TIME
+// CURRENT TIME STRING
 // ============================================================
 
 String getTimeString() {
 
   if (
-    !isTimeValid()
-  )
+    !isTimeValid())
     return "--:--:--";
 
 
@@ -684,8 +636,7 @@ String getTimeString() {
 
   struct tm* t =
     localtime(
-      &now
-    );
+      &now);
 
 
   if (!t)
@@ -700,55 +651,81 @@ String getTimeString() {
     "%02d:%02d:%02d",
     t->tm_hour,
     t->tm_min,
-    t->tm_sec
-  );
+    t->tm_sec);
 
 
   return String(
-    buffer
-  );
+    buffer);
 }
 
 
 // ============================================================
 // CALCULATE BRIGHTNESS
+//
+// Uses seconds instead of minutes.
+//
+// Example:
+//
+// Ramp up = 10 minutes
+//
+// 18:00:00 = 0%
+// 18:01:00 = 10%
+// 18:05:00 = 50%
+// 18:09:00 = 90%
+// 18:10:00 = 100%
+//
+// The function is called every 100 ms, so the actual PWM
+// transition is much smoother than a one-minute step.
 // ============================================================
 
 int calculateBrightness() {
 
-  int now =
-    minutesSinceMidnight();
-
-
   if (
-    now < 0
-  )
+    !isTimeValid())
     return 0;
 
 
-  int start =
-    settings.startHour * 60 +
-    settings.startMinute;
+  int nowSeconds =
+    secondsSinceMidnight();
 
 
-  int duration =
-    settings.durationMinutes;
+  if (
+    nowSeconds < 0)
+    return 0;
 
 
-  int rampUp =
-    settings.rampUpMinutes;
+  int startSeconds =
+    settings.startHour * 3600 + settings.startMinute * 60;
 
 
-  int rampDown =
-    settings.rampDownMinutes;
+  int durationSeconds =
+    settings.durationMinutes * 60;
 
+
+  int rampUpSeconds =
+    settings.rampUpMinutes * 60;
+
+
+  int rampDownSeconds =
+    settings.rampDownMinutes * 60;
+
+
+  // ----------------------------------------------------------
+  // Elapsed time since schedule start
+  //
+  // Handles crossing midnight.
+  // ----------------------------------------------------------
 
   int elapsed =
-    (
-      now -
-      start +
-      1440
-    ) % 1440;
+    nowSeconds - startSeconds;
+
+
+  if (
+    elapsed < 0) {
+
+    elapsed +=
+      24 * 3600;
+  }
 
 
   // ----------------------------------------------------------
@@ -756,72 +733,61 @@ int calculateBrightness() {
   // ----------------------------------------------------------
 
   if (
-    duration < 1440
-  ) {
+    durationSeconds < 24 * 3600) {
 
     if (
-      elapsed >= duration
-    )
+      elapsed >= durationSeconds) {
+
       return 0;
+    }
   }
 
 
   // ----------------------------------------------------------
-  // Ramp UP
+  // RAMP UP
   // ----------------------------------------------------------
 
   if (
-    rampUp > 0 &&
-    elapsed < rampUp
-  ) {
+    rampUpSeconds > 0 && elapsed < rampUpSeconds) {
 
     float level =
-      (float)elapsed /
-      (float)rampUp;
+      (float)elapsed / (float)rampUpSeconds;
+
+
+    float brightness =
+      level * settings.maxBrightness;
 
 
     return constrain(
-      (int)(
-        level *
-        settings.maxBrightness
-      ),
+      (int)brightness,
       0,
-      settings.maxBrightness
-    );
+      settings.maxBrightness);
   }
 
 
   // ----------------------------------------------------------
-  // Ramp DOWN
+  // RAMP DOWN
   // ----------------------------------------------------------
 
   int rampDownStart =
-    duration -
-    rampDown;
+    durationSeconds - rampDownSeconds;
 
 
   if (
-    rampDown > 0 &&
-    duration < 1440 &&
-    elapsed >= rampDownStart
-  ) {
+    rampDownSeconds > 0 && durationSeconds < 24 * 3600 && elapsed >= rampDownStart) {
 
     float remaining =
-      (float)(
-        duration -
-        elapsed
-      ) /
-      (float)rampDown;
+      (float)(durationSeconds - elapsed) / (float)rampDownSeconds;
+
+
+    float brightness =
+      remaining * settings.maxBrightness;
 
 
     return constrain(
-      (int)(
-        remaining *
-        settings.maxBrightness
-      ),
+      (int)brightness,
       0,
-      settings.maxBrightness
-    );
+      settings.maxBrightness);
   }
 
 
@@ -840,22 +806,18 @@ int calculateBrightness() {
 void updateLight() {
 
   if (
-    manualMode
-  ) {
+    manualMode) {
 
     if (
-      manualState
-    ) {
+      manualState) {
 
       setBrightness(
-        settings.maxBrightness
-      );
+        settings.maxBrightness);
 
     } else {
 
       setBrightness(
-        0
-      );
+        0);
     }
 
     return;
@@ -867,8 +829,7 @@ void updateLight() {
 
 
   setBrightness(
-    brightness
-  );
+    brightness);
 }
 
 
@@ -877,14 +838,10 @@ void updateLight() {
 // ============================================================
 
 String formatMinutes(
-  int totalMinutes
-) {
+  int totalMinutes) {
 
   totalMinutes =
-    (
-      totalMinutes % 1440 +
-      1440
-    ) % 1440;
+    (totalMinutes % 1440 + 1440) % 1440;
 
 
   int hour =
@@ -902,13 +859,11 @@ String formatMinutes(
     buffer,
     "%02d:%02d",
     hour,
-    minute
-  );
+    minute);
 
 
   return String(
-    buffer
-  );
+    buffer);
 }
 
 
@@ -919,13 +874,11 @@ String formatMinutes(
 String getScheduleStart() {
 
   int start =
-    settings.startHour * 60 +
-    settings.startMinute;
+    settings.startHour * 60 + settings.startMinute;
 
 
   return formatMinutes(
-    start
-  );
+    start);
 }
 
 
@@ -936,18 +889,15 @@ String getScheduleStart() {
 String getScheduleFullBrightness() {
 
   int start =
-    settings.startHour * 60 +
-    settings.startMinute;
+    settings.startHour * 60 + settings.startMinute;
 
 
   int full =
-    start +
-    settings.rampUpMinutes;
+    start + settings.rampUpMinutes;
 
 
   return formatMinutes(
-    full
-  );
+    full);
 }
 
 
@@ -958,38 +908,34 @@ String getScheduleFullBrightness() {
 String getScheduleOff() {
 
   int start =
-    settings.startHour * 60 +
-    settings.startMinute;
+    settings.startHour * 60 + settings.startMinute;
 
 
   int off =
-    start +
-    settings.durationMinutes;
+    start + settings.durationMinutes;
 
 
   return formatMinutes(
-    off
-  );
+    off);
 }
 
 
 // ============================================================
-// WIFI AP
+// START ACCESS POINT
 // ============================================================
 
 void startAccessPoint() {
 
   Serial.println();
   Serial.println(
-    "===================================="
-  );
+    "====================================");
 
   Serial.println(
-    "STARTING GXDE WIFI SETUP"
-  );
+    "STARTING GXDE WIFI SETUP");
 
 
-  apMode = true;
+  apMode =
+    true;
 
 
   WiFi.disconnect();
@@ -999,61 +945,73 @@ void startAccessPoint() {
 
 
   WiFi.mode(
-    WIFI_AP
-  );
+    WIFI_AP);
 
 
   bool result =
     WiFi.softAP(
-      AP_NAME
-    );
+      AP_NAME);
 
-// WiFi.softAP(
-//       AP_NAME,
-//       AP_PASSWORD
-//     );
+  // bool result =
+  //   WiFi.softAP(
+  //     AP_NAME,
+  //     AP_PASSWORD);
 
   if (result) {
 
     Serial.println(
-      "Configuration AP started"
-    );
+      "Configuration AP started");
 
     Serial.print(
-      "AP name: "
-    );
+      "AP name: ");
 
     Serial.println(
-      AP_NAME
-    );
+      AP_NAME);
 
     Serial.print(
-      "AP password: "
-    );
+      "AP password: ");
 
     Serial.println(
-      AP_PASSWORD
-    );
+      AP_PASSWORD);
 
     Serial.print(
-      "AP IP: "
-    );
+      "AP IP: ");
 
     Serial.println(
-      WiFi.softAPIP()
-    );
+      WiFi.softAPIP());
 
   } else {
 
     Serial.println(
-      "ERROR: Failed to start AP"
-    );
+      "ERROR: Failed to start AP");
   }
 
 
   Serial.println(
-    "===================================="
-  );
+    "====================================");
+}
+
+
+// ============================================================
+// STOP ACCESS POINT
+// ============================================================
+
+void stopAccessPoint() {
+
+  if (!apMode)
+    return;
+
+
+  Serial.println(
+    "Stopping configuration AP");
+
+
+  WiFi.softAPdisconnect(
+    true);
+
+
+  apMode =
+    false;
 }
 
 
@@ -1064,12 +1022,10 @@ void startAccessPoint() {
 bool connectToWiFi() {
 
   if (
-    wifiSSID.length() == 0
-  ) {
+    wifiSSID.length() == 0) {
 
     Serial.println(
-      "No WiFi credentials."
-    );
+      "No WiFi credentials.");
 
     return false;
   }
@@ -1077,48 +1033,31 @@ bool connectToWiFi() {
 
   Serial.println();
   Serial.println(
-    "Connecting to saved WiFi..."
-  );
+    "Connecting to saved WiFi...");
 
 
   Serial.print(
-    "SSID: "
-  );
+    "SSID: ");
 
   Serial.println(
-    wifiSSID
-  );
-
-
-  apMode = false;
+    wifiSSID);
 
 
   WiFi.mode(
-    WIFI_STA
-  );
+    WIFI_STA);
 
 
   WiFi.begin(
     wifiSSID.c_str(),
-    wifiPassword.c_str()
-  );
+    wifiPassword.c_str());
 
 
   unsigned long start =
     millis();
 
 
-  // ----------------------------------------------------------
-  // Short connection timeout.
-  //
-  // We deliberately don't wait 20-30 seconds.
-  // If connection fails, AP starts immediately.
-  // ----------------------------------------------------------
-
   while (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - start < 8000
-  ) {
+    WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
 
     delay(100);
 
@@ -1127,33 +1066,30 @@ bool connectToWiFi() {
 
 
   if (
-    WiFi.status() ==
-    WL_CONNECTED
-  ) {
+    WiFi.status() == WL_CONNECTED) {
 
     Serial.println();
 
     Serial.println(
-      "WiFi connected!"
-    );
+      "WiFi connected!");
 
 
     Serial.print(
-      "IP: "
-    );
+      "IP: ");
 
     Serial.println(
-      WiFi.localIP()
-    );
+      WiFi.localIP());
 
 
     Serial.print(
-      "RSSI: "
-    );
+      "RSSI: ");
 
     Serial.println(
-      WiFi.RSSI()
-    );
+      WiFi.RSSI());
+
+
+    apMode =
+      false;
 
 
     return true;
@@ -1163,10 +1099,263 @@ bool connectToWiFi() {
   Serial.println();
 
   Serial.println(
-    "WiFi connection failed."
-  );
+    "WiFi connection failed.");
+
+
+  WiFi.disconnect();
+
 
   return false;
+}
+
+
+// ============================================================
+// INITIAL WIFI SETUP
+// ============================================================
+
+void setupWiFi() {
+
+  bool hasWiFi =
+    loadWiFiCredentials();
+
+
+  if (
+    !hasWiFi) {
+
+    startAccessPoint();
+
+    return;
+  }
+
+
+  bool connected =
+    connectToWiFi();
+
+
+  if (
+    connected) {
+
+    apMode =
+      false;
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Saved SSID unavailable / wrong password / connection fail
+  // ----------------------------------------------------------
+
+  Serial.println(
+    "Saved WiFi unavailable.");
+
+  Serial.println(
+    "Starting configuration AP.");
+
+
+  startAccessPoint();
+}
+
+
+// ============================================================
+// AUTOMATIC WIFI MANAGEMENT
+// ============================================================
+
+void updateWiFi() {
+
+  // ----------------------------------------------------------
+  // No saved credentials
+  // ----------------------------------------------------------
+
+  if (
+    wifiSSID.length() == 0) {
+
+    if (
+      !apMode) {
+
+      startAccessPoint();
+    }
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Currently connected
+  // ----------------------------------------------------------
+
+  if (
+    WiFi.status() == WL_CONNECTED) {
+
+    // If station is connected, no need for AP.
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // AP MODE
+  //
+  // Keep AP available while periodically trying the saved
+  // network again.
+  // ----------------------------------------------------------
+
+  if (
+    apMode) {
+
+    if (
+      millis() - lastAPRetryAttempt >= WIFI_AP_RETRY_INTERVAL_MS) {
+
+      lastAPRetryAttempt =
+        millis();
+
+
+      Serial.println();
+      Serial.println(
+        "Retrying saved WiFi while AP is active...");
+
+
+      WiFi.mode(
+        WIFI_STA);
+
+
+      WiFi.begin(
+        wifiSSID.c_str(),
+        wifiPassword.c_str());
+
+
+      unsigned long start =
+        millis();
+
+
+      while (
+        WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+
+        server.handleClient();
+
+        checkWiFiButton();
+
+        updateLight();
+
+        delay(100);
+
+        yield();
+      }
+
+
+      if (
+        WiFi.status() == WL_CONNECTED) {
+
+        Serial.println();
+        Serial.println(
+          "WiFi connection restored.");
+
+
+        Serial.print(
+          "IP: ");
+
+        Serial.println(
+          WiFi.localIP());
+
+
+        apMode =
+          false;
+
+
+        return;
+      }
+
+
+      Serial.println(
+        "Saved WiFi still unavailable.");
+
+      startAccessPoint();
+
+      return;
+    }
+
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // NORMAL STATION MODE BUT DISCONNECTED
+  // ----------------------------------------------------------
+
+  if (
+    millis() - lastWiFiReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
+
+    lastWiFiReconnectAttempt =
+      millis();
+
+
+    Serial.println();
+    Serial.println(
+      "WiFi disconnected.");
+
+    Serial.println(
+      "Attempting automatic reconnection...");
+
+
+    WiFi.disconnect();
+
+
+    delay(100);
+
+
+    WiFi.mode(
+      WIFI_STA);
+
+
+    WiFi.begin(
+      wifiSSID.c_str(),
+      wifiPassword.c_str());
+
+
+    unsigned long start =
+      millis();
+
+
+    while (
+      WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+
+      server.handleClient();
+
+      checkWiFiButton();
+
+      updateLight();
+
+      delay(100);
+
+      yield();
+    }
+
+
+    if (
+      WiFi.status() == WL_CONNECTED) {
+
+      Serial.println(
+        "WiFi reconnected!");
+
+      Serial.print(
+        "IP: ");
+
+      Serial.println(
+        WiFi.localIP());
+
+      return;
+    }
+
+
+    Serial.println(
+      "Reconnection failed.");
+
+    Serial.println(
+      "Falling back to AP mode.");
+
+
+    startAccessPoint();
+  }
 }
 
 
@@ -1175,8 +1364,7 @@ bool connectToWiFi() {
 // ============================================================
 
 const char WIFI_HTML[] PROGMEM =
-R"rawliteral(
-
+  R"rawliteral(
 <!DOCTYPE html>
 
 <html>
@@ -1379,38 +1567,56 @@ font-size:12px;
 color:#00ff9c;
 }
 
-
 .passwordRow {
-  display: flex;
-  align-items: center;
-  gap: 0;
-  margin-top: 7px;
+
+display:flex;
+
+align-items:center;
+
+gap:0;
+
+margin-top:7px;
 }
 
 .passwordRow input {
-  flex: 1;
-  margin-top: 0;
-  border-radius: 6px 0 0 6px;
+
+flex:1;
+
+margin-top:0;
+
+border-radius:6px 0 0 6px;
 }
 
 .passwordToggle {
-  width: 42px;
-  height: 50px;
-  min-height: 37px;
-  margin-top: 0;
-  padding: 0;
 
-  border-left: none;
-  border-radius: 0 6px 6px 0;
+width:42px;
 
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
+height:50px;
+
+min-height:37px;
+
+margin-top:0;
+
+padding:0;
+
+border-left:none;
+
+border-radius:0 6px 6px 0;
+
+display:flex;
+
+align-items:center;
+
+justify-content:center;
+
+cursor:pointer;
 }
+
 .passwordToggle svg {
-  width: 20px;
-  height: 20px;
+
+width:20px;
+
+height:20px;
 }
 
 </style>
@@ -1438,11 +1644,9 @@ the controller will remain unchanged.
 
 </div>
 
-
 <form
 action="/wifi/save"
 method="POST">
-
 
 <div class="card">
 
@@ -1474,30 +1678,41 @@ style="margin-top:10px">
 
 </div>
 
-
 <div class="card">
 
 <label>
 WIFI PASSWORD
 </label>
+
 <div class="passwordRow">
+
 <input
 type="password"
 name="password"
 id="password"
 placeholder="Wi-Fi password">
 
-     <button type="button" id="passwordButton" class="passwordToggle"
-                      aria-label="Toggle password visibility" onclick="togglePassword()">
-                      <!-- SVG Eye Icon (Visible by Default) -->
-                      <svg id="eyeIcon" viewBox="0 0 24 24">
-                        <path
-                          d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.01-.16c0-1.66-1.34-3-3-3l-.16.01z" />
-                      </svg>
-                    </button>
-</div>
+<button
+type="button"
+id="passwordButton"
+class="passwordToggle"
+aria-label="Toggle password visibility"
+onclick="togglePassword()">
+
+<svg
+id="eyeIcon"
+viewBox="0 0 24 24">
+
+<path
+d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.01-.16c0-1.66-1.34-3-3-3l-.16.01z"/>
+
+</svg>
+
+</button>
+
 </div>
 
+</div>
 
 <button
 type="submit">
@@ -1506,56 +1721,59 @@ SAVE WIFI & RESTART
 
 </button>
 
-
 </form>
-
 
 <div id="message"></div>
 
 </div>
 
-
 <script>
 
-   /* ========================================================
-             PASSWORD SHOW / HIDE
-          ======================================================== */
-          const eyeOpenPath = "M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z";
-          const eyeClosedPath = "M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.01-.16c0-1.66-1.34-3-3-3l-.16.01z";
+const eyeOpenPath =
+"M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z";
 
-          function togglePassword() {
+const eyeClosedPath =
+"M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.01-.16c0-1.66-1.34-3-3-3l-.16.01z";
 
-            const password =
-              document.getElementById(
-                'password'
-              );
+function togglePassword(){
 
-            const button =
-              document.getElementById(
-                'passwordButton'
-              );
+  const password =
+    document.getElementById(
+      "password"
+    );
 
-            if (
-              password.type === 'password'
-            ) {
+  if(
+    password.type === "password"
+  ){
 
-              password.type =
-                'text';
+    password.type =
+      "text";
 
-              // button.innerText ='HIDE';
-              document.querySelector('#eyeIcon path').setAttribute('d', eyeOpenPath);
-            }
+    document
+      .querySelector(
+        "#eyeIcon path"
+      )
+      .setAttribute(
+        "d",
+        eyeOpenPath
+      );
 
-            else {
+  }else{
 
-              password.type =
-                'password';
+    password.type =
+      "password";
 
-              // button.innerText = 'SHOW';
-              document.querySelector('#eyeIcon path').setAttribute('d', eyeClosedPath);
-            }
+    document
+      .querySelector(
+        "#eyeIcon path"
+      )
+      .setAttribute(
+        "d",
+        eyeClosedPath
+      );
+  }
+}
 
-          }
 
 async function scanNetworks(){
 
@@ -1573,7 +1791,6 @@ async function scanNetworks(){
       document.getElementById(
         "ssid"
       );
-
 
     networks.forEach(
       function(network){
@@ -1612,13 +1829,10 @@ async function scanNetworks(){
       }
     );
 
-
   }catch(e){
 
     console.log(e);
-
   }
-
 }
 
 
@@ -1629,11 +1843,6 @@ scanNetworks();
 </body>
 
 </html>
-
-
-
-
-
 )rawliteral";
 
 
@@ -1642,9 +1851,7 @@ scanNetworks();
 // ============================================================
 
 const char INDEX_HTML[] PROGMEM =
-
-R"rawliteral(
-
+  R"rawliteral(
 <!DOCTYPE html>
 
 <html>
@@ -1997,7 +2204,6 @@ LIGHT OFF
 
 </div>
 
-
 <div class="card">
 
 <div class="title">
@@ -2011,7 +2217,6 @@ type="time"
 id="start">
 
 </div>
-
 
 <div class="card">
 
@@ -2036,7 +2241,6 @@ value="720">
 
 </div>
 
-
 <div class="card">
 
 <div class="title">
@@ -2059,7 +2263,6 @@ max="100"
 value="100">
 
 </div>
-
 
 <div class="card">
 
@@ -2084,7 +2287,6 @@ value="10">
 
 </div>
 
-
 <div class="card">
 
 <div class="title">
@@ -2108,7 +2310,6 @@ value="10">
 
 </div>
 
-
 <div class="card schedule">
 
 <div>
@@ -2127,7 +2328,6 @@ OFF:
 </div>
 
 </div>
-
 
 <div class="buttons">
 
@@ -2150,7 +2350,6 @@ SAVE SETTINGS
 
 </div>
 
-
 <div
 class="saveStatus"
 id="saveStatus">
@@ -2159,13 +2358,11 @@ SETTINGS SAVED
 
 </div>
 
-
 <div class="footer">
 GXDE LIGHT CONTROLLER
 </div>
 
 </div>
-
 
 <script>
 
@@ -2318,7 +2515,7 @@ function updateSchedule(){
 
 
 // ==========================================================
-// LOAD ACTUAL SAVED SETTINGS
+// LOAD SETTINGS
 // ==========================================================
 
 async function loadSettings(){
@@ -2371,7 +2568,6 @@ async function loadSettings(){
 
     updateSchedule();
 
-
   }catch(e){
 
     console.log(
@@ -2411,7 +2607,6 @@ async function update(){
           ? "ON"
           : "OFF"
       );
-
 
   }catch(e){
 
@@ -2592,7 +2787,6 @@ setInterval(
 </body>
 
 </html>
-
 )rawliteral";
 
 
@@ -2603,14 +2797,12 @@ setInterval(
 void handleRoot() {
 
   if (
-    apMode
-  ) {
+    apMode) {
 
     server.send_P(
       200,
       "text/html",
-      WIFI_HTML
-    );
+      WIFI_HTML);
 
     return;
   }
@@ -2619,8 +2811,7 @@ void handleRoot() {
   server.send_P(
     200,
     "text/html",
-    INDEX_HTML
-  );
+    INDEX_HTML);
 }
 
 
@@ -2633,10 +2824,9 @@ void handleStatus() {
   int brightness =
     manualMode
       ? (
-          manualState
-            ? settings.maxBrightness
-            : 0
-        )
+        manualState
+          ? settings.maxBrightness
+          : 0)
       : calculateBrightness();
 
 
@@ -2668,8 +2858,7 @@ void handleStatus() {
   server.send(
     200,
     "application/json",
-    json
-  );
+    json);
 }
 
 
@@ -2742,8 +2931,7 @@ void handleSettings() {
   server.send(
     200,
     "application/json",
-    json
-  );
+    json);
 }
 
 
@@ -2758,31 +2946,27 @@ void handleSave() {
   // ----------------------------------------------------------
 
   if (
-    server.hasArg("start")
-  ) {
+    server.hasArg("start")) {
 
     String t =
-      server.arg(
-        "start"
-      );
+      server.arg("start");
 
 
     if (
-      t.length() >= 5
-    ) {
+      t.length() >= 5) {
 
       settings.startHour =
         t.substring(
-          0,
-          2
-        ).toInt();
+           0,
+           2)
+          .toInt();
 
 
       settings.startMinute =
         t.substring(
-          3,
-          5
-        ).toInt();
+           3,
+           5)
+          .toInt();
     }
   }
 
@@ -2793,14 +2977,12 @@ void handleSave() {
 
   if (
     server.hasArg(
-      "duration"
-    )
-  ) {
+      "duration")) {
 
     settings.durationMinutes =
       server.arg(
-        "duration"
-      ).toInt();
+              "duration")
+        .toInt();
   }
 
 
@@ -2810,14 +2992,12 @@ void handleSave() {
 
   if (
     server.hasArg(
-      "brightness"
-    )
-  ) {
+      "brightness")) {
 
     settings.maxBrightness =
       server.arg(
-        "brightness"
-      ).toInt();
+              "brightness")
+        .toInt();
   }
 
 
@@ -2827,14 +3007,12 @@ void handleSave() {
 
   if (
     server.hasArg(
-      "rampUp"
-    )
-  ) {
+      "rampUp")) {
 
     settings.rampUpMinutes =
       server.arg(
-        "rampUp"
-      ).toInt();
+              "rampUp")
+        .toInt();
   }
 
 
@@ -2844,14 +3022,12 @@ void handleSave() {
 
   if (
     server.hasArg(
-      "rampDown"
-    )
-  ) {
+      "rampDown")) {
 
     settings.rampDownMinutes =
       server.arg(
-        "rampDown"
-      ).toInt();
+              "rampDown")
+        .toInt();
   }
 
 
@@ -2863,48 +3039,72 @@ void handleSave() {
     constrain(
       settings.startHour,
       0,
-      23
-    );
+      23);
 
 
   settings.startMinute =
     constrain(
       settings.startMinute,
       0,
-      59
-    );
+      59);
 
 
   settings.durationMinutes =
     constrain(
       settings.durationMinutes,
       1,
-      1440
-    );
+      1440);
 
 
   settings.maxBrightness =
     constrain(
       settings.maxBrightness,
       1,
-      100
-    );
+      100);
 
 
   settings.rampUpMinutes =
     constrain(
       settings.rampUpMinutes,
       0,
-      120
-    );
+      120);
 
 
   settings.rampDownMinutes =
     constrain(
       settings.rampDownMinutes,
       0,
-      120
-    );
+      120);
+
+
+  // ----------------------------------------------------------
+  // Prevent ramp overlap
+  // ----------------------------------------------------------
+
+  if (
+    settings.durationMinutes < 1440) {
+
+    if (
+      settings.rampUpMinutes > settings.durationMinutes) {
+
+      settings.rampUpMinutes =
+        settings.durationMinutes;
+    }
+
+
+    int remaining =
+      settings.durationMinutes - settings.rampUpMinutes;
+
+
+    if (
+      settings.rampDownMinutes > remaining) {
+
+      settings.rampDownMinutes =
+        max(
+          0,
+          remaining);
+    }
+  }
 
 
   // ----------------------------------------------------------
@@ -2915,7 +3115,12 @@ void handleSave() {
     saveSettings();
 
 
+  // Saving settings returns control to automatic mode.
+
   manualMode =
+    false;
+
+  manualState =
     false;
 
 
@@ -2951,8 +3156,7 @@ void handleSave() {
 
     "application/json",
 
-    json
-  );
+    json);
 }
 
 
@@ -2964,15 +3168,12 @@ void handleManual() {
 
   if (
     !server.hasArg(
-      "state"
-    )
-  ) {
+      "state")) {
 
     server.send(
       400,
       "text/plain",
-      "Missing state"
-    );
+      "Missing state");
 
     return;
   }
@@ -2984,8 +3185,8 @@ void handleManual() {
 
   manualState =
     server.arg(
-      "state"
-    ) == "1";
+      "state")
+    == "1";
 
 
   updateLight();
@@ -2994,8 +3195,7 @@ void handleManual() {
   server.send(
     200,
     "text/plain",
-    "OK"
-  );
+    "OK");
 }
 
 
@@ -3016,12 +3216,10 @@ void handleWiFiScan() {
   for (
     int i = 0;
     i < count;
-    i++
-  ) {
+    i++) {
 
     if (
-      i > 0
-    )
+      i > 0)
       json += ",";
 
 
@@ -3029,19 +3227,13 @@ void handleWiFiScan() {
       WiFi.SSID(i);
 
 
-    // --------------------------------------------------------
-    // Basic JSON escaping
-    // --------------------------------------------------------
-
     name.replace(
       "\\",
-      "\\\\"
-    );
+      "\\\\");
 
     name.replace(
       "\"",
-      "\\\""
-    );
+      "\\\"");
 
 
     json +=
@@ -3071,8 +3263,7 @@ void handleWiFiScan() {
   server.send(
     200,
     "application/json",
-    json
-  );
+    json);
 }
 
 
@@ -3092,47 +3283,42 @@ void handleWiFiSave() {
 
   if (
     server.hasArg(
-      "manualssid"
-    )
-  ) {
+      "manualssid")) {
 
     ssid =
       server.arg(
-        "manualssid"
-      );
+        "manualssid");
 
     ssid.trim();
   }
 
 
   // ----------------------------------------------------------
-  // If manual SSID is empty, use selected SSID.
+  // Selected SSID
   // ----------------------------------------------------------
 
   if (
-    ssid.length() == 0 &&
-    server.hasArg("ssid")
-  ) {
+    ssid.length() == 0 && server.hasArg("ssid")) {
 
     ssid =
       server.arg(
-        "ssid"
-      );
+        "ssid");
 
     ssid.trim();
   }
 
+
+  // ----------------------------------------------------------
+  // Password
+  // ----------------------------------------------------------
 
   if (
     server.hasArg(
-      "password"
-    )
-  ) {
+      "password")) {
 
     password =
       server.arg(
-        "password"
-      );
+        "password");
   }
 
 
@@ -3141,42 +3327,36 @@ void handleWiFiSave() {
   // ----------------------------------------------------------
 
   if (
-    ssid.length() == 0
-  ) {
+    ssid.length() == 0) {
 
     server.send(
       400,
       "text/plain",
-      "SSID is required"
-    );
+      "SSID is required");
 
     return;
   }
 
 
   if (
-    ssid.length() > 32
-  ) {
+    ssid.length() > 32) {
 
     server.send(
       400,
       "text/plain",
-      "SSID too long"
-    );
+      "SSID too long");
 
     return;
   }
 
 
   if (
-    password.length() > 64
-  ) {
+    password.length() > 64) {
 
     server.send(
       400,
       "text/plain",
-      "Password too long"
-    );
+      "Password too long");
 
     return;
   }
@@ -3189,22 +3369,19 @@ void handleWiFiSave() {
   if (
     !saveWiFiCredentials(
       ssid,
-      password
-    )
-  ) {
+      password)) {
 
     server.send(
       500,
       "text/plain",
-      "Failed to save WiFi credentials"
-    );
+      "Failed to save WiFi credentials");
 
     return;
   }
 
 
   // ----------------------------------------------------------
-  // Send response before restarting.
+  // Response before restart
   // ----------------------------------------------------------
 
   server.send(
@@ -3223,8 +3400,7 @@ void handleWiFiSave() {
     "<p>Wi-Fi saved successfully.</p>"
     "<p>Restarting...</p>"
     "</body>"
-    "</html>"
-  );
+    "</html>");
 
 
   delay(1000);
@@ -3241,45 +3417,63 @@ void handleWiFiSave() {
 void setupNTP() {
 
   if (
-    WiFi.status() !=
-    WL_CONNECTED
-  ) {
+    WiFi.status() != WL_CONNECTED) {
 
     Serial.println(
-      "NTP skipped - no internet connection"
-    );
+      "NTP waiting for WiFi.");
 
     return;
   }
 
 
   Serial.println(
-    "Configuring NTP..."
-  );
+    "Configuring NTP...");
 
 
-  // Philippines = UTC+8
+  // Philippines UTC+8
 
   configTime(
     8 * 3600,
     0,
     "pool.ntp.org",
     "time.nist.gov",
-    "time.google.com"
-  );
+    "time.google.com");
 
 
   Serial.println(
-    "NTP configured"
-  );
+    "NTP configured");
+}
 
 
-  // ----------------------------------------------------------
-  // Do NOT block for a long time.
-  //
-  // NTP will synchronize in the background.
-  // This makes startup much faster.
-  // ----------------------------------------------------------
+// ============================================================
+// CHECK NTP AFTER WIFI RECOVERY
+// ============================================================
+
+void checkNTP() {
+
+  static bool wasConnected =
+    false;
+
+
+  bool connected =
+    WiFi.status() == WL_CONNECTED;
+
+
+  if (
+    connected && !wasConnected) {
+
+    Serial.println(
+      "WiFi connection available.");
+
+    Serial.println(
+      "Refreshing NTP configuration.");
+
+    setupNTP();
+  }
+
+
+  wasConnected =
+    connected;
 }
 
 
@@ -3290,8 +3484,7 @@ void setupNTP() {
 void resetWiFiFromButton() {
 
   if (
-    wifiResetTriggered
-  )
+    wifiResetTriggered)
     return;
 
 
@@ -3301,38 +3494,22 @@ void resetWiFiFromButton() {
 
   Serial.println();
   Serial.println(
-    "===================================="
-  );
-
+    "====================================");
 
   Serial.println(
-    "FLASH BUTTON WIFI RESET"
-  );
+    "FLASH BUTTON WIFI RESET");
 
-
-  // ----------------------------------------------------------
-  // Delete only Wi-Fi credentials.
-  // ----------------------------------------------------------
 
   deleteWiFiCredentials();
 
 
   Serial.println(
-    "WiFi credentials erased."
-  );
+    "WiFi credentials erased.");
 
 
   Serial.println(
-    "Release FLASH button."
-  );
+    "Release FLASH button.");
 
-
-  // ----------------------------------------------------------
-  // Wait for release.
-  //
-  // This is important because GPIO0 is the ESP8266
-  // boot strap pin.
-  // ----------------------------------------------------------
 
   unsigned long releaseStart =
     millis();
@@ -3340,23 +3517,14 @@ void resetWiFiFromButton() {
 
   while (
     digitalRead(
-      WIFI_BUTTON_PIN
-    ) == LOW
-  ) {
+      WIFI_BUTTON_PIN)
+    == LOW) {
 
     if (
-      millis() -
-      releaseStart >
-      15000
-    ) {
+      millis() - releaseStart > 15000) {
 
       Serial.println(
-        "WARNING: FLASH still held."
-      );
-
-      Serial.println(
-        "Waiting..."
-      );
+        "WARNING: FLASH still held.");
 
       releaseStart =
         millis();
@@ -3370,13 +3538,11 @@ void resetWiFiFromButton() {
 
 
   Serial.println(
-    "FLASH released."
-  );
+    "FLASH released.");
 
 
   Serial.println(
-    "Restarting ESP8266..."
-  );
+    "Restarting ESP8266...");
 
 
   delay(500);
@@ -3394,8 +3560,7 @@ void checkWiFiButton() {
 
   int state =
     digitalRead(
-      WIFI_BUTTON_PIN
-    );
+      WIFI_BUTTON_PIN);
 
 
   // ----------------------------------------------------------
@@ -3403,12 +3568,10 @@ void checkWiFiButton() {
   // ----------------------------------------------------------
 
   if (
-    !wifiButtonArmed
-  ) {
+    !wifiButtonArmed) {
 
     if (
-      state == HIGH
-    ) {
+      state == HIGH) {
 
       wifiButtonArmed =
         true;
@@ -3426,28 +3589,23 @@ void checkWiFiButton() {
   // ----------------------------------------------------------
 
   if (
-    state == LOW &&
-    wifiButtonPrevious == HIGH
-  ) {
+    state == LOW && wifiButtonPrevious == HIGH) {
 
     delay(
-      WIFI_BUTTON_DEBOUNCE_MS
-    );
+      WIFI_BUTTON_DEBOUNCE_MS);
 
 
     if (
       digitalRead(
-        WIFI_BUTTON_PIN
-      ) == LOW
-    ) {
+        WIFI_BUTTON_PIN)
+      == LOW) {
 
       wifiButtonPressStart =
         millis();
 
 
       Serial.println(
-        "FLASH pressed"
-      );
+        "FLASH pressed");
     }
   }
 
@@ -3457,19 +3615,14 @@ void checkWiFiButton() {
   // ----------------------------------------------------------
 
   if (
-    state == LOW &&
-    wifiButtonPressStart != 0
-  ) {
+    state == LOW && wifiButtonPressStart != 0) {
 
     unsigned long held =
-      millis() -
-      wifiButtonPressStart;
+      millis() - wifiButtonPressStart;
 
 
     if (
-      held >=
-      WIFI_BUTTON_HOLD_MS
-    ) {
+      held >= WIFI_BUTTON_HOLD_MS) {
 
       resetWiFiFromButton();
 
@@ -3483,9 +3636,7 @@ void checkWiFiButton() {
   // ----------------------------------------------------------
 
   if (
-    state == HIGH &&
-    wifiButtonPrevious == LOW
-  ) {
+    state == HIGH && wifiButtonPrevious == LOW) {
 
     wifiButtonPressStart =
       0;
@@ -3498,65 +3649,53 @@ void checkWiFiButton() {
 
 
 // ============================================================
-// SETUP WEB SERVER ROUTES
+// WEB SERVER ROUTES
 // ============================================================
 
 void setupWebServer() {
 
   server.on(
     "/",
-    handleRoot
-  );
+    handleRoot);
 
 
   server.on(
     "/status",
-    handleStatus
-  );
+    handleStatus);
 
 
   server.on(
     "/settings",
-    handleSettings
-  );
+    handleSettings);
 
 
   server.on(
     "/save",
-    handleSave
-  );
+    handleSave);
 
 
   server.on(
     "/manual",
-    handleManual
-  );
+    handleManual);
 
-
-  // ----------------------------------------------------------
-  // WiFi AP routes
-  // ----------------------------------------------------------
 
   server.on(
     "/wifi/scan",
     HTTP_GET,
-    handleWiFiScan
-  );
+    handleWiFiScan);
 
 
   server.on(
     "/wifi/save",
     HTTP_POST,
-    handleWiFiSave
-  );
+    handleWiFiSave);
 
 
   server.begin();
 
 
   Serial.println(
-    "Web server started"
-  );
+    "Web server started");
 }
 
 
@@ -3567,8 +3706,7 @@ void setupWebServer() {
 void setup() {
 
   Serial.begin(
-    115200
-  );
+    115200);
 
 
   delay(300);
@@ -3576,16 +3714,13 @@ void setup() {
 
   Serial.println();
   Serial.println(
-    "===================================="
-  );
+    "====================================");
 
   Serial.println(
-    "GXDE LIGHT CONTROLLER"
-  );
+    "GXDE LIGHT CONTROLLER");
 
   Serial.println(
-    "===================================="
-  );
+    "====================================");
 
 
   // ==========================================================
@@ -3594,19 +3729,16 @@ void setup() {
 
   pinMode(
     WIFI_BUTTON_PIN,
-    INPUT_PULLUP
-  );
+    INPUT_PULLUP);
 
 
   wifiButtonPrevious =
     digitalRead(
-      WIFI_BUTTON_PIN
-    );
+      WIFI_BUTTON_PIN);
 
 
   if (
-    wifiButtonPrevious == HIGH
-  ) {
+    wifiButtonPrevious == HIGH) {
 
     wifiButtonArmed =
       true;
@@ -3619,18 +3751,15 @@ void setup() {
 
   pinMode(
     PWM_PIN,
-    OUTPUT
-  );
+    OUTPUT);
 
 
   analogWriteRange(
-    PWM_MAX
-  );
+    PWM_MAX);
 
 
   setBrightness(
-    0
-  );
+    0);
 
 
   // ==========================================================
@@ -3638,20 +3767,17 @@ void setup() {
   // ==========================================================
 
   if (
-    !LittleFS.begin()
-  ) {
+    !LittleFS.begin()) {
 
     Serial.println(
-      "ERROR: LittleFS failed"
-    );
+      "ERROR: LittleFS failed");
 
     return;
   }
 
 
   Serial.println(
-    "LittleFS mounted"
-  );
+    "LittleFS mounted");
 
 
   // ==========================================================
@@ -3662,47 +3788,10 @@ void setup() {
 
 
   // ==========================================================
-  // LOAD WIFI CREDENTIALS
-  // ==========================================================
-
-  bool hasWiFi =
-    loadWiFiCredentials();
-
-
-  // ==========================================================
   // WIFI
   // ==========================================================
 
-  bool connected =
-    false;
-
-
-  if (
-    hasWiFi
-  ) {
-
-    connected =
-      connectToWiFi();
-  }
-
-
-  // ----------------------------------------------------------
-  // If no credentials OR connection failed:
-  //
-  // Start AP immediately.
-  // ----------------------------------------------------------
-
-  if (
-    !connected
-  ) {
-
-    startAccessPoint();
-
-  } else {
-
-    apMode =
-      false;
-  }
+  setupWiFi();
 
 
   // ==========================================================
@@ -3731,8 +3820,7 @@ void setup() {
 
 
   setBrightness(
-    0
-  );
+    0);
 
 
   // ==========================================================
@@ -3741,107 +3829,79 @@ void setup() {
 
   Serial.println();
   Serial.println(
-    "===================================="
-  );
+    "====================================");
 
 
   Serial.println(
-    "GXDE LIGHT READY"
-  );
+    "GXDE LIGHT READY");
 
 
   Serial.print(
-    "Schedule: "
-  );
-
+    "Schedule: ");
 
   Serial.print(
-    getScheduleStart()
-  );
-
+    getScheduleStart());
 
   Serial.print(
-    " -> "
-  );
-
+    " -> ");
 
   Serial.println(
-    getScheduleOff()
-  );
+    getScheduleOff());
 
 
   Serial.print(
-    "Full brightness: "
-  );
-
+    "Full brightness: ");
 
   Serial.println(
-    getScheduleFullBrightness()
-  );
+    getScheduleFullBrightness());
 
 
   if (
-    apMode
-  ) {
+    apMode) {
 
     Serial.println();
     Serial.println(
-      "WIFI SETUP MODE"
-    );
+      "WIFI SETUP MODE");
 
 
     Serial.print(
-      "Connect to: "
-    );
-
+      "Connect to: ");
 
     Serial.println(
-      AP_NAME
-    );
+      AP_NAME);
 
 
     Serial.print(
-      "Password: "
-    );
-
+      "Password: ");
 
     Serial.println(
-      AP_PASSWORD
-    );
+      AP_PASSWORD);
 
 
     Serial.print(
-      "Open: http://"
-    );
-
+      "Open: http://");
 
     Serial.println(
-      WiFi.softAPIP()
-    );
+      WiFi.softAPIP());
 
   } else {
 
     Serial.println();
     Serial.print(
-      "GXDE IP: "
-    );
-
+      "GXDE IP: ");
 
     Serial.println(
-      WiFi.localIP()
-    );
+      WiFi.localIP());
   }
 
 
   Serial.println();
   Serial.println(
-    "FLASH hold 5 seconds = reset WiFi"
-  );
+    "FLASH hold 5 seconds = reset WiFi");
 
 
   Serial.println(
-    "===================================="
-  );
+    "====================================");
 }
 
 
@@ -3866,16 +3926,29 @@ void loop() {
 
 
   // ----------------------------------------------------------
-  // Update light once per second
+  // WiFi management
+  // ----------------------------------------------------------
+
+  updateWiFi();
+
+
+  // ----------------------------------------------------------
+  // NTP after WiFi recovery
+  // ----------------------------------------------------------
+
+  checkNTP();
+
+
+  // ----------------------------------------------------------
+  // LIGHT
+  //
+  // Update every 100 ms.
   // ----------------------------------------------------------
 
   if (
-    millis() -
-    lastUpdate >=
-    1000
-  ) {
+    millis() - lastLightUpdate >= LIGHT_UPDATE_INTERVAL_MS) {
 
-    lastUpdate =
+    lastLightUpdate =
       millis();
 
 
